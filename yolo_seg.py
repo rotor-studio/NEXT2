@@ -95,10 +95,10 @@ def segment_people(frame: np.ndarray, model: YOLO, people_limit: int, mask_thres
     person_boxes = []
     for idx in person_indices:
         m = masks[idx]
-        # Resize mask from model space to frame space.
-        m_resized = cv2.resize(m, (w, h), interpolation=cv2.INTER_NEAREST)
-        m_bin = (m_resized > 0.5).astype(np.uint8) * 255
-        person_mask = cv2.bitwise_or(person_mask, m_bin.astype(np.uint8))
+        # Resize mask from model space to frame space and scale to 0-255 for flexible thresholding.
+        m_resized = cv2.resize(m, (w, h), interpolation=cv2.INTER_LINEAR)
+        m_uint8 = np.clip(m_resized * 255.0, 0, 255).astype(np.uint8)
+        person_mask = cv2.bitwise_or(person_mask, m_uint8)
         person_boxes.append(boxes_all[idx])
 
     # Suavizado configurable.
