@@ -310,11 +310,11 @@ def open_capture(source: str):
 def source_label():
     if CURRENT_SOURCE == "camera":
         return "Camera"
-    if VIDEO_FILES:
-        return f"Video: {VIDEO_FILES[CURRENT_VIDEO_INDEX].name}"
     if CURRENT_SOURCE == "ndi":
         return "NDI"
-    return "Video"
+    if CURRENT_SOURCE == "video" and VIDEO_FILES:
+        return f"Video: {VIDEO_FILES[CURRENT_VIDEO_INDEX].name}"
+    return CURRENT_SOURCE
 
 
 def capture_ready(cap):
@@ -444,7 +444,8 @@ class NDIReceiver:
             return None
         ndi = self.ndi
         try:
-            frame_type, video_frame, _, _ = ndi.recv_capture_v2(self.recv, 0)
+            # wait up to 100ms for a frame
+            frame_type, video_frame, _, _ = ndi.recv_capture_v2(self.recv, 100)
             if frame_type == ndi.FRAME_TYPE_NONE:
                 return None
             if frame_type != ndi.FRAME_TYPE_VIDEO:
