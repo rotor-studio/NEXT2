@@ -54,41 +54,92 @@ def pick_source(ndi):
 
 
 def main():
+    log_path = "/tmp/ndi_receive.log"
+    def log(msg: str):
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(msg + "\n")
+        print(msg, flush=True)
+
+    log("[NDI] Arrancando test...")
     try:
-        import NDIlib as ndi  # type: ignore
+        import cyndilib as ndi  # type: ignore
+        import importlib.resources as ir
+        try:
+            bin_path = ir.files("cyndilib.wrapper").joinpath("bin")
+            bin_str = str(bin_path)
+            os.environ.setdefault("NDI_RUNTIME_DIR", bin_str)
+            os.environ["DYLD_LIBRARY_PATH"] = f"{bin_str}:{os.environ.get('DYLD_LIBRARY_PATH','')}"
+        except Exception:
+            pass
     except Exception as exc:
-        print(f"No se pudo importar NDIlib: {exc}", file=sys.stderr)
+        log(f"No se pudo importar cyndilib: {exc}")
         return 1
 
-    if not ndi.initialize():
-        print("No se pudo inicializar NDIlib.", file=sys.stderr)
+    log("[NDI] Iniciando test de recepción...")
+    finder = ndi.Finder()
+    finder.open()
+    finder.wait_for_sources(2.0)
+    sources = list(finder.iter_sources())
+    finder.close()
+    if not sources:
+        log("No se encontraron fuentes NDI.")
         return 1
+    log(f"[NDI] Fuentes encontradas: {[getattr(s,'name','') for s in sources]}")
+    env_name = os.environ.get("NDI_SOURCE", "").lower()
+    selected = None
+    if env_name:
+        for s in sources:
+            name = getattr(s, "name", "") or ""
+            if env_name in name.lower():
+                selected = s
+                break
+    if selected is None:
+        selected = sources[0]
+    log(f"Conectando a: {getattr(selected, 'name', 'NDI')} (valid={getattr(selected,'valid',None)})")
+    try:
+        selected.update()
+    except Exception:
+        pass
 
-    src = pick_source(ndi)
-    if src is None:
-        return 1
-
-    recv_settings = ndi.RecvCreateV3()
-    recv_settings.color_format = ndi.RECV_COLOR_FORMAT_BGRX_BGRA
-    recv_settings.allow_video_fields = False
-    recv_settings.source_to_connect_to = src
-    recv = ndi.recv_create_v3(recv_settings)
-    if recv is None:
-        print("No se pudo crear el receptor NDI.", file=sys.stderr)
-        return 1
+    recv = ndi.Receiver(
+        source_name=getattr(selected, "name", ""),
+        color_format=ndi.RecvColorFormat.BGRX_BGRA,
+        bandwidth=ndi.RecvBandwidth.highest,
+        allow_video_fields=False,
+        recv_name="ndi_receive_test",
+    )
+    fs = recv.frame_sync
+    fs.set_video_frame(ndi.VideoFrameSync())
+    # Forzamos connect usando Source para asegurar dirección completa.
+    try:
+        recv.connect_to(selected)
+    except Exception:
+        pass
+    try:
+        recv._wait_for_connect(2.0)
+    except Exception:
+        pass
+    log(f"[NDI] Conectado a {getattr(selected, 'name', 'NDI')} ({getattr(selected, 'stream_name', '')})")
 
     prev = time.time()
     fps = 0.0
+    last_log = time.time()
 
     while True:
-        frame_type, video_frame, _, _ = ndi.recv_capture_v2(recv, 100)
-        if frame_type == ndi.FRAME_TYPE_VIDEO:
-            h, w = video_frame.yres, video_frame.xres
-            data = np.frombuffer(video_frame.data, dtype=np.uint8)
-            frame_bgra = data.reshape((h, video_frame.line_stride_in_bytes // 4, 4))
-            frame = frame_bgra[:, :w, :3].copy()
-            ndi.recv_free_video_v2(recv, video_frame)
-
+        fs.capture_video()
+        vf = fs.video_frame
+        w, h = vf.get_resolution()
+        stride = vf.get_line_stride()
+        mv = memoryview(vf)
+        flat = np.frombuffer(mv, dtype=np.uint8).copy()
+        mv.release()
+        now = time.time()
+        if now - last_log > 2.0:
+            log(f"[NDI] loop connected={recv.is_connected()} num_conn={recv.get_num_connections()} size={flat.size} w={w} h={h} stride={stride}")
+            last_log = now
+        if flat.size >= stride * h and w > 0 and h > 0:
+            frame_bgra = flat[: stride * h].reshape((h, stride))[:, : w * 4].reshape((h, w, 4))
+            frame = frame_bgra[:, :, :3].copy()
             frame = resize_keep_aspect(frame, MAX_HEIGHT)
             now = time.time()
             dt = now - prev
@@ -96,16 +147,17 @@ def main():
             fps = 1.0 / dt if dt > 0 else fps
             cv2.putText(frame, f"FPS {fps:05.1f}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             cv2.imshow("NDI Receive Test", frame)
-        else:
-            # No frame; show black placeholder
-            placeholder = np.zeros((MAX_HEIGHT, int(MAX_HEIGHT * 16 / 9), 3), dtype=np.uint8)
-            cv2.putText(placeholder, "Esperando NDI...", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-            cv2.imshow("NDI Receive Test", placeholder)
+            continue
+
+        # No frame; show black placeholder
+        placeholder = np.zeros((MAX_HEIGHT, int(MAX_HEIGHT * 16 / 9), 3), dtype=np.uint8)
+        cv2.putText(placeholder, "Esperando NDI...", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        cv2.imshow("NDI Receive Test", placeholder)
 
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
 
-    ndi.recv_destroy(recv)
+    recv.disconnect()
     cv2.destroyAllWindows()
     return 0
 

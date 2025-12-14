@@ -9,7 +9,10 @@ from __future__ import annotations
 import sys
 import time
 from typing import Tuple
+import os
+import multiprocessing as mp
 from pathlib import Path
+from fractions import Fraction
 import cv2
 import numpy as np
 import torch
@@ -35,12 +38,22 @@ CURRENT_MODEL_KEY = ord("a")
 CURRENT_MODEL_PATH = MODEL_OPTIONS[CURRENT_MODEL_KEY][0]
 PEOPLE_LIMIT_OPTIONS = list(range(1, 21))
 CURRENT_PEOPLE_LIMIT = 10
-ENABLE_NDI = True     # Envía la máscara por NDI
+def env_flag(name: str, default: bool = True) -> bool:
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return val.strip().lower() not in {"0", "false", "no", "off"}
+
+
+ENABLE_NDI = env_flag("NEXT_ENABLE_NDI", True)  # Permite desactivar NDI si está inestable
+ENABLE_NDI_OUTPUT = env_flag("NEXT_ENABLE_NDI_OUTPUT", True)  # Publicar máscara por NDI
 DATA_DIR = Path(__file__).with_name("DATA")
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv"}
 VIDEO_FILES = sorted([p for p in DATA_DIR.glob("*") if p.suffix.lower() in VIDEO_EXTS])
-CURRENT_SOURCE = "camera"  # "camera", "video" o "ndi"
+DEFAULT_SOURCE = "camera"  # se ajusta en runtime tras probar NDI
+CURRENT_SOURCE = DEFAULT_SOURCE  # "camera", "video" o "ndi"
 CURRENT_VIDEO_INDEX = 0
+NDI_PREFERRED_SOURCE = "MadMapper"
 BLUR_KERNEL_OPTIONS = [1, 3, 5, 7, 9, 11, 13]
 BLUR_KERNEL_IDX = 2  # valor inicial -> kernel 5
 MASK_THRESH = 127
@@ -200,13 +213,13 @@ def add_header(canvas: np.ndarray, fps: float, device: str, res_text: str, peopl
 
 def add_footer(canvas: np.ndarray, current_res: int) -> None:
     """Draw footer with resolution selector hint."""
-    footer_y1 = canvas.shape[0] - 220
-    footer_y2 = canvas.shape[0] - 190
-    footer_y3 = canvas.shape[0] - 160
-    footer_y4 = canvas.shape[0] - 130
-    footer_y5 = canvas.shape[0] - 100
-    footer_y6 = canvas.shape[0] - 70
-    footer_y7 = canvas.shape[0] - 40
+    footer_y1 = canvas.shape[0] - 240
+    footer_y2 = canvas.shape[0] - 210
+    footer_y3 = canvas.shape[0] - 180
+    footer_y4 = canvas.shape[0] - 140
+    footer_y5 = canvas.shape[0] - 110
+    footer_y6 = canvas.shape[0] - 80
+    footer_y7 = canvas.shape[0] - 50
     res_opts = " | ".join(f"{i+1}:{r}" for i, r in enumerate(RES_OPTIONS))
     model_opts = " | ".join(f"{chr(k)}:{v[0]}" for k, v in MODEL_OPTIONS.items())
     cv2.putText(canvas, f"RES -> {res_opts} ", (10, footer_y1),
@@ -299,7 +312,7 @@ def open_capture(source: str):
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAP_HEIGHT)
         return cap
     if source == "ndi":
-        return NDIReceiver()
+        return NDIReceiver(source_name=NDI_PREFERRED_SOURCE)
     if source == "video":
         if not VIDEO_FILES:
             print("No hay videos en DATA/", file=sys.stderr)
@@ -339,6 +352,54 @@ def release_capture(cap):
             pass
 
 
+# --------------- helpers NDI --------------------------------------
+def get_ndi_module():
+    """Intentar importar cyndilib (preferido). Evitamos NDIlib por segfaults reportados."""
+    try:
+        import importlib.resources as ir
+        # Aseguramos ruta de runtime NDI para cyndilib (incluye libndi.dylib empaquetado).
+        try:
+            bin_path = ir.files("cyndilib.wrapper").joinpath("bin")
+            bin_str = str(bin_path)
+            os.environ.setdefault("NDI_RUNTIME_DIR", bin_str)
+            os.environ["DYLD_LIBRARY_PATH"] = f"{bin_str}:{os.environ.get('DYLD_LIBRARY_PATH','')}"
+        except Exception:
+            pass
+        import cyndilib as ndi  # type: ignore
+
+        return ndi
+    except Exception:
+        return None
+
+
+# --------------- Probing seguro de NDI ----------------------------
+def _ndi_probe_worker(result_queue: mp.Queue):
+    """Intento seguro de cargar NDIlib en un proceso aislado."""
+    try:
+        import cyndilib as ndi  # type: ignore
+        finder = ndi.Finder()
+        finder.open()
+        finder.wait_for_sources(0.5)
+        result_queue.put(finder.num_sources > 0)
+        finder.close()
+    except Exception:
+        result_queue.put(False)
+
+
+def probe_ndi_available(timeout: float = 3.0) -> bool:
+    """Carga NDIlib en un proceso aparte para evitar segfaults en el proceso principal."""
+    q: mp.Queue = mp.Queue()
+    p = mp.Process(target=_ndi_probe_worker, args=(q,), daemon=True)
+    p.start()
+    p.join(timeout)
+    ok = False
+    if p.exitcode is None:
+        p.terminate()
+    elif p.exitcode == 0 and not q.empty():
+        ok = bool(q.get())
+    return ok
+
+
 # --------------- Syphon (opcional) ----------------------------------
 class SyphonPublisher:
     """Wrapper para publicar frames por Syphon si la librería está disponible."""
@@ -359,46 +420,65 @@ class NDIPublisher:
         self.ndi = None
         self.sender = None
         self.ready = False
+        self._announced = False
+        self.vf = None
         if not ENABLE_NDI:
             return
         try:
-            import NDIlib as ndi  # type: ignore
+            ndi = get_ndi_module()
+            if ndi is None or not hasattr(ndi, "Sender"):
+                raise RuntimeError("No se pudo importar cyndilib Sender")
 
-            if not ndi.initialize():
-                print("[NDI] No se pudo inicializar NDIlib.", file=sys.stderr)
-                return
-            send_settings = ndi.SendCreate()
-            send_settings.ndi_name = name
-            self.sender = ndi.send_create(send_settings)
             self.ndi = ndi
-            self.ready = True
+            self.sender = ndi.Sender(ndi_name=name)
         except Exception as exc:
             print(f"[NDI] No disponible: {exc}", file=sys.stderr)
             self.sender = None
             self.ndi = None
 
     def publish(self, frame: np.ndarray):
-        if self.sender is None or self.ndi is None or not self.ready:
+        if self.sender is None or self.ndi is None:
             return
         try:
             ndi = self.ndi
+            VideoSendFrame = ndi.video_frame.VideoSendFrame if hasattr(ndi, "video_frame") else None
             # Convertimos a BGRA para NDI.
             if frame.ndim == 2:
                 frame_bgra = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGRA)
             else:
                 frame_bgra = cv2.cvtColor(frame, cv2.COLOR_BGR2BGRA)
+            if not frame_bgra.flags["C_CONTIGUOUS"]:
+                frame_bgra = frame_bgra.copy()
 
             h, w = frame_bgra.shape[:2]
-            video_frame = ndi.VideoFrameV2()
-            video_frame.xres = w
-            video_frame.yres = h
-            video_frame.FourCC = ndi.FOURCC_VIDEO_TYPE_BGRA
-            video_frame.frame_rate_N = 60
-            video_frame.frame_rate_D = 1
-            video_frame.line_stride_in_bytes = frame_bgra.strides[0]
-            video_frame.data = frame_bgra
-
-            ndi.send_send_video_v2(self.sender, video_frame)
+            # Inicializar VideoSendFrame si hace falta o si cambia la resolución.
+            if self.vf is None or self.vf.get_resolution() != (w, h):
+                if VideoSendFrame is None:
+                    print("[NDI] cyndilib sin VideoSendFrame; no se envía.", file=sys.stderr)
+                    return
+                if self.ready:
+                    # Si el sender está abierto y cambia la resolución, cerrar y reconfigurar.
+                    try:
+                        self.sender.close()
+                    except Exception:
+                        pass
+                    self.ready = False
+                vf = VideoSendFrame()
+                vf.set_resolution(w, h)
+                vf.set_fourcc(ndi.FourCC.BGRA)
+                # Usa 60fps como valor por defecto; NDI ajusta internamente.
+                vf.set_frame_rate(Fraction(60, 1))
+                self.sender.set_video_frame(vf)
+                self.vf = vf
+                if not self.ready:
+                    # Abrimos el sender una vez tengamos frame configurado.
+                    self.sender.open()
+                    self.ready = True
+            # write_video_async admite memoryview 1D
+            self.sender.write_video_async(frame_bgra.ravel(order="C"))
+            if not self._announced:
+                print(f"[NDI] Enviando salida NDI '{self.name}' ({w}x{h})", file=sys.stderr)
+                self._announced = True
         except Exception as exc:
             print(f"[NDI] Error al publicar: {exc}", file=sys.stderr)
 
@@ -410,32 +490,52 @@ class NDIReceiver:
         self.ndi = None
         self.recv = None
         self.ready = False
+        self.source_name = source_name
         if not ENABLE_NDI:
             return
         try:
-            import NDIlib as ndi  # type: ignore
-            if not ndi.initialize():
-                print("[NDI] No se pudo inicializar NDIlib para entrada.", file=sys.stderr)
-                return
-            # Buscar fuente si no se especifica.
-            if source_name is None:
-                finder = ndi.find_create_v2()
-                ndi.find_wait_for_sources(finder, 2000)
-                sources = ndi.find_get_current_sources(finder)
-                if sources and len(sources) > 0:
-                    source_name = sources[0].ndi_name
-                ndi.find_destroy(finder)
-            if source_name is None:
+            ndi = get_ndi_module()
+            if ndi is None or not hasattr(ndi, "Receiver"):
+                raise RuntimeError("No se pudo importar cyndilib Receiver")
+
+            finder = ndi.Finder()
+            finder.open()
+            finder.wait_for_sources(2.0)
+            sources = list(finder.iter_sources())
+            finder.close()
+
+            if not sources:
                 print("[NDI] No se encontraron fuentes NDI.", file=sys.stderr)
                 return
 
-            recv_settings = ndi.RecvCreateV3()
-            recv_settings.color_format = ndi.RECV_COLOR_FORMAT_BGRX_BGRA
-            recv_settings.allow_video_fields = False
-            recv_settings.source_to_connect_to = ndi.Source(source_name, None)
-            self.recv = ndi.recv_create_v3(recv_settings)
+            preferred = (source_name or "").lower().strip()
+            selected = None
+            for src in sources:
+                name = getattr(src, "name", "") or getattr(src, "stream_name", "") or ""
+                if preferred and preferred in name.lower():
+                    selected = src
+                    break
+            if selected is None:
+                selected = sources[0]
+
+            self.recv = ndi.Receiver(
+                source_name=getattr(selected, "name", ""),
+                color_format=ndi.RecvColorFormat.BGRX_BGRA,
+                bandwidth=ndi.RecvBandwidth.highest,
+                allow_video_fields=False,
+                recv_name="NEXT2-Recv",
+            )
+            # Usar FrameSync para simplificar la lectura de vídeo.
+            vf_sync = ndi.video_frame.VideoFrameSync()
+            self.recv.frame_sync.set_video_frame(vf_sync)
+            self.recv.connect_to(selected)
+            try:
+                self.recv._wait_for_connect(2.0)
+            except Exception:
+                pass
             self.ndi = ndi
             self.ready = True
+            print(f"[NDI] Conectado a '{getattr(selected, 'name', 'NDI')}'", file=sys.stderr)
         except Exception as exc:
             print(f"[NDI] No se pudo preparar la entrada NDI: {exc}", file=sys.stderr)
             self.ndi = None
@@ -448,18 +548,18 @@ class NDIReceiver:
             return None
         ndi = self.ndi
         try:
-            # wait up to 100ms for a frame
-            frame_type, video_frame, _, _ = ndi.recv_capture_v2(self.recv, 100)
-            if frame_type == ndi.FRAME_TYPE_NONE:
+            fs = self.recv.frame_sync
+            fs.capture_video()
+            vf = fs.video_frame
+            w, h = vf.get_resolution()
+            stride = vf.get_line_stride()
+            mv = memoryview(vf)
+            flat = np.frombuffer(mv, dtype=np.uint8).copy()
+            mv.release()
+            if flat.size < stride * h or w <= 0 or h <= 0:
                 return None
-            if frame_type != ndi.FRAME_TYPE_VIDEO:
-                return None
-            h, w = video_frame.yres, video_frame.xres
-            # video_frame.data is bytes; interpret as BGRA then drop alpha.
-            data = np.frombuffer(video_frame.data, dtype=np.uint8)
-            frame_bgra = data.reshape((h, video_frame.line_stride_in_bytes // 4, 4))
-            frame_bgr = frame_bgra[:, :w, :3].copy()
-            ndi.recv_free_video_v2(self.recv, video_frame)
+            frame_bgra = flat[: stride * h].reshape((h, stride))[:, : w * 4].reshape((h, w, 4))
+            frame_bgr = frame_bgra[:, :, :3].copy()
             return frame_bgr
         except Exception as exc:
             print(f"[NDI] Error al recibir: {exc}", file=sys.stderr)
@@ -475,15 +575,42 @@ def main():
     # Carga modelo YOLOv8 de segmentación (usa uno ligero por defecto).
     model_path = "yolov8n-seg.pt"
     global DEVICE, CURRENT_MODEL_PATH, CURRENT_MODEL_KEY, CURRENT_PEOPLE_LIMIT, CURRENT_SOURCE
-    global BLUR_KERNEL_IDX, MASK_THRESH, BLUR_ENABLED, IMG_SIZE_IDX, HIGH_PRECISION_MODE
+    global BLUR_KERNEL_IDX, MASK_THRESH, BLUR_ENABLED, IMG_SIZE_IDX, HIGH_PRECISION_MODE, ENABLE_NDI, DEFAULT_SOURCE
     load_saved_resolution()
     load_saved_model()
-    if torch.backends.mps.is_available():
-        DEVICE = "mps"
-    elif torch.cuda.is_available():
-        DEVICE = "cuda"
+    env_device = os.environ.get("NEXT_DEVICE", "").strip().lower()
+    if env_device and env_device != "auto":
+        # Permite forzar cpu/mps/cuda para esquivar crashes nativos.
+        DEVICE = env_device
+    elif env_device == "auto":
+        if torch.backends.mps.is_available():
+            DEVICE = "mps"
+        elif torch.cuda.is_available():
+            DEVICE = "cuda"
+        else:
+            DEVICE = "cpu"
     else:
+        # Por defecto CPU para evitar segfaults en algunos backends (mps/AVFoundation).
         DEVICE = "cpu"
+
+    env_source = os.environ.get("NEXT_SOURCE", "").strip().lower()
+    # Probar NDI en proceso aislado para evitar segfault en main.
+    ndi_ok = False
+    if ENABLE_NDI:
+        ndi_ok = probe_ndi_available()
+        if not ndi_ok:
+            print("[NDI] No se pudo inicializar NDIlib (se desactiva).", file=sys.stderr)
+            ENABLE_NDI = False
+
+    # Decide fuente por env o por disponibilidad (por defecto cámara; NDI se selecciona a mano).
+    if env_source in {"ndi", "camera", "video"}:
+        CURRENT_SOURCE = env_source
+    else:
+        CURRENT_SOURCE = "camera"
+
+    if CURRENT_SOURCE == "ndi" and not ENABLE_NDI:
+        print("[NDI] Fuente NDI solicitada pero NDI no está disponible, usando cámara.", file=sys.stderr)
+        CURRENT_SOURCE = "camera"
 
     try:
         model = load_model(CURRENT_MODEL_PATH)
@@ -509,7 +636,7 @@ def main():
     last_boxes = None
     last_frame = None
     show_detail = False
-    ndi_pub = NDIPublisher("NEXT2 Mask NDI") if ENABLE_NDI else None
+    ndi_pub = NDIPublisher("NEXT2 Mask NDI") if ENABLE_NDI and ENABLE_NDI_OUTPUT else None
 
     while True:
         frame = capture_frame(cap)
@@ -542,6 +669,15 @@ def main():
         else:
             mask_soft, mask_detail, boxes = last_mask_soft, last_mask_detail, last_boxes
         frame_idx += 1
+
+        # Fallback en caso de no tener máscaras aún (evita crash en cvtColor).
+        if mask_soft is None or mask_detail is None:
+            h, w = frame.shape[:2]
+            fallback_mask = np.zeros((h, w), dtype=np.uint8)
+            if mask_soft is None:
+                mask_soft = fallback_mask
+            if mask_detail is None:
+                mask_detail = fallback_mask
 
         boxed = draw_boxes(frame, boxes)
 

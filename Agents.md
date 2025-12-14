@@ -24,7 +24,7 @@ Persistence
 Running
 - Conda env: `conda run -n NEXT python yolo_seg.py`
 - Requires: `ultralytics`, `opencv-python`, `torch` (MPS/CPU auto-selected; CUDA if available)
-- NDI: publica la máscara como fuente “NEXT2 Mask NDI” (BGRA) si `ndi-python` está instalado.
+- NDI in/out: usa `cyndilib` (runtime incluido). Pulsa `n` para entrar a NDI input (MadMapper) y la máscara sale siempre como “NEXT2 Mask NDI” (BGRA) cuando hay frames.
 
 Performance tips
 - Lower resolution (1–3) for higher FPS.
