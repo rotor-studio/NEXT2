@@ -1,7 +1,7 @@
 """
 Real-time human segmentation using YOLOv8 (segment task) with OpenCV.
-Pipeline: capture -> segment -> mask -> composite.
-Windows shown: original (con FPS), mask binaria, composite (siluetas blancas sobre negro).
+Pipeline: captura -> segmentación -> máscara -> composite.
+Ventana única 1280x720: vista original anotada (FPS + boxes) y máscara binaria.
 """
 
 from __future__ import annotations
@@ -9,11 +9,31 @@ from __future__ import annotations
 import sys
 import time
 from typing import Tuple
-
+from pathlib import Path
 import cv2
 import numpy as np
+import torch
 from ultralytics import YOLO
 
+# Configuración de rendimiento
+RES_OPTIONS = [160, 240, 320, 360, 480]  # opciones de altura máxima
+CURRENT_MAX_HEIGHT = 240  # valor inicial (se sobreescribe si hay guardado)
+IMG_SIZE = 320    # resolución de inferencia YOLO
+PROCESS_EVERY_N = 2  # procesa 1 de cada N frames (2 = mitad)
+CAP_WIDTH = 640   # resolución solicitada a la cámara (puede ajustarse)
+CAP_HEIGHT = 480
+DEVICE = None
+RES_SAVE_FILE = Path(__file__).with_name("resolution.txt")
+MODEL_SAVE_FILE = Path(__file__).with_name("model.txt")
+MODEL_OPTIONS = {
+    ord("a"): ("yolov8n-seg.pt", "yolov8n-seg (rapido)"),
+    ord("s"): ("yolov8s-seg.pt", "yolov8s-seg (balance)"),
+    ord("d"): ("yolov8m-seg.pt", "yolov8m-seg (mas pesado)"),
+}
+CURRENT_MODEL_KEY = ord("a")
+CURRENT_MODEL_PATH = MODEL_OPTIONS[CURRENT_MODEL_KEY][0]
+PEOPLE_LIMIT_OPTIONS = list(range(1, 21))
+CURRENT_PEOPLE_LIMIT = 10
 
 # --------------- utils de captura y redimensionado -----------------
 def resize_keep_aspect(frame, max_height: int = 480):
@@ -31,27 +51,31 @@ def capture_frame(cap: cv2.VideoCapture):
     ok, frame = cap.read()
     if not ok:
         return None
-    return resize_keep_aspect(frame, max_height=480)
+    return resize_keep_aspect(frame, max_height=CURRENT_MAX_HEIGHT)
 
 
 # --------------- segmentación --------------------------------------
-def segment_people(frame: np.ndarray, model: YOLO) -> np.ndarray:
+def segment_people(frame: np.ndarray, model: YOLO) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Run YOLOv8 segmentation on the frame and return a global person mask (0-255, uint8).
+    Run YOLOv8 segmentation and return:
+    - mask: global person mask (0-255, uint8) resized to frame size.
+    - boxes: ndarray of person boxes (N, 4) in xyxy format.
     - Combines all person masks with bitwise OR.
     - Returns all-black mask if no persons are found.
     """
     h, w = frame.shape[:2]
-    result = model(frame, verbose=False)[0]
+    result = model(frame, imgsz=IMG_SIZE, verbose=False, device=DEVICE)[0]
 
     # If the model returns no masks, bail early.
     if result.masks is None or result.boxes is None:
-        return np.zeros((h, w), dtype=np.uint8)
+        return np.zeros((h, w), dtype=np.uint8), np.empty((0, 4))
 
     masks = result.masks.data.cpu().numpy()  # shape: (N, H, W) in model space
     classes = result.boxes.cls.cpu().numpy().astype(int)  # shape: (N,)
+    boxes_all = result.boxes.xyxy.cpu().numpy()
 
     person_mask = np.zeros((h, w), dtype=np.uint8)
+    person_boxes = []
     for m, cls_id in zip(masks, classes):
         if cls_id != 0:  # 0 is "person" in COCO
             continue
@@ -59,11 +83,15 @@ def segment_people(frame: np.ndarray, model: YOLO) -> np.ndarray:
         m_resized = cv2.resize(m, (w, h), interpolation=cv2.INTER_NEAREST)
         m_bin = (m_resized > 0.5).astype(np.uint8) * 255
         person_mask = cv2.bitwise_or(person_mask, m_bin.astype(np.uint8))
+    for cls_id, box in zip(classes, boxes_all):
+        if cls_id != 0:
+            continue
+        person_boxes.append(box)
 
     # Suavizado para silueta más orgánica.
     person_mask = cv2.GaussianBlur(person_mask, (5, 5), 0)
     _, person_mask = cv2.threshold(person_mask, 127, 255, cv2.THRESH_BINARY)
-    return person_mask
+    return person_mask, np.array(person_boxes)
 
 
 # --------------- composición y overlays ----------------------------
@@ -74,30 +102,153 @@ def make_composite(frame: np.ndarray, mask: np.ndarray) -> np.ndarray:
     return composite
 
 
-def draw_fps(frame: np.ndarray, fps: float) -> np.ndarray:
-    """Overlay FPS onto the frame."""
+def fit_to_box(image: np.ndarray, box_size: Tuple[int, int]) -> np.ndarray:
+    """Resize image to fit inside box_size keeping aspect ratio; letterbox on black (top-aligned)."""
+    box_w, box_h = box_size
+    h, w = image.shape[:2]
+    scale = min(box_w / w, box_h / h)
+    new_size = (max(1, int(w * scale)), max(1, int(h * scale)))
+    resized = cv2.resize(image, new_size, interpolation=cv2.INTER_AREA)
+
+    canvas = np.zeros((box_h, box_w, 3), dtype=np.uint8)
+    y_off = 0  # align to top
+    x_off = (box_w - new_size[0]) // 2
+    canvas[y_off : y_off + new_size[1], x_off : x_off + new_size[0]] = resized
+    return canvas
+
+
+def add_overlay(image: np.ndarray, label: str) -> np.ndarray:
+    """Add label overlay to an image (top-left) with small white text."""
+    overlay = image.copy()
+    cv2.putText(overlay, label, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+    return overlay
+
+
+def draw_boxes(frame: np.ndarray, boxes: np.ndarray) -> np.ndarray:
+    """Draw bounding boxes on the frame."""
     out = frame.copy()
-    text = f"FPS: {fps:.1f}"
-    cv2.putText(out, text, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    if boxes is None:
+        return out
+    for box in boxes:
+        x1, y1, x2, y2 = box.astype(int)
+        cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 255), 2)
     return out
+
+
+def add_header(canvas: np.ndarray, fps: float, device: str, res_text: str, people_count: int) -> None:
+    """Draw a single header line with resolution, FPS, device, model and people count at the top of the canvas."""
+    current_model_label = MODEL_OPTIONS.get(CURRENT_MODEL_KEY, (CURRENT_MODEL_PATH, CURRENT_MODEL_PATH))[1]
+    text = (
+        f"RES: {res_text} | FPS: {fps:.1f} | GPU: {device} | "
+        f"MODEL: {current_model_label} | PEOPLE NOW: {people_count}"
+    )
+    cv2.putText(canvas, text, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+
+
+def add_footer(canvas: np.ndarray, current_res: int) -> None:
+    """Draw footer with resolution selector hint."""
+    footer_y1 = canvas.shape[0] - 170
+    footer_y2 = canvas.shape[0] - 140
+    footer_y3 = canvas.shape[0] - 110
+    res_opts = " | ".join(f"{i+1}:{r}" for i, r in enumerate(RES_OPTIONS))
+    model_opts = " | ".join(f"{chr(k)}:{v[0]}" for k, v in MODEL_OPTIONS.items())
+    cv2.putText(canvas, f"RES -> {res_opts} ", (10, footer_y1),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+    current_model_label = MODEL_OPTIONS.get(CURRENT_MODEL_KEY, ("", ""))[1]
+    cv2.putText(canvas, f"MODEL -> {model_opts} ", (10, footer_y2),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+    cv2.putText(canvas, f"PEOPLE -> +/- (NOW: {CURRENT_PEOPLE_LIMIT})", (10, footer_y3),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+
+
+def set_resolution_by_index(idx: int):
+    """Set CURRENT_MAX_HEIGHT by index."""
+    global CURRENT_MAX_HEIGHT
+    idx = max(0, min(idx, len(RES_OPTIONS) - 1))
+    CURRENT_MAX_HEIGHT = RES_OPTIONS[idx]
+    try:
+        RES_SAVE_FILE.write_text(str(CURRENT_MAX_HEIGHT), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def load_saved_resolution():
+    """Load saved resolution if present and valid."""
+    global CURRENT_MAX_HEIGHT
+    try:
+        val = int(RES_SAVE_FILE.read_text(encoding="utf-8").strip())
+        if val in RES_OPTIONS:
+            CURRENT_MAX_HEIGHT = val
+    except (OSError, ValueError):
+        pass
+
+
+def load_saved_model():
+    """Load saved model path if present and valid, updating current key/path."""
+    global CURRENT_MODEL_KEY, CURRENT_MODEL_PATH
+    try:
+        val = MODEL_SAVE_FILE.read_text(encoding="utf-8").strip()
+        for k, (path, _) in MODEL_OPTIONS.items():
+            if path == val:
+                CURRENT_MODEL_KEY = k
+                CURRENT_MODEL_PATH = path
+                return
+    except OSError:
+        pass
+
+
+def save_current_model():
+    """Persist current model path."""
+    try:
+        MODEL_SAVE_FILE.write_text(CURRENT_MODEL_PATH, encoding="utf-8")
+    except OSError:
+        pass
+
+
+def load_model(path: str):
+    """Load YOLO model on the configured device."""
+    mdl = YOLO(path)
+    mdl.to(DEVICE)
+    return mdl
 
 
 # --------------- loop principal ------------------------------------
 def main():
     # Carga modelo YOLOv8 de segmentación (usa uno ligero por defecto).
     model_path = "yolov8n-seg.pt"
+    global DEVICE, CURRENT_MODEL_PATH, CURRENT_MODEL_KEY, CURRENT_PEOPLE_LIMIT
+    load_saved_resolution()
+    load_saved_model()
+    if torch.backends.mps.is_available():
+        DEVICE = "mps"
+    elif torch.cuda.is_available():
+        DEVICE = "cuda"
+    else:
+        DEVICE = "cpu"
+
     try:
-        model = YOLO(model_path)
+        model = load_model(CURRENT_MODEL_PATH)
     except Exception as exc:
-        print(f"No se pudo cargar el modelo {model_path}: {exc}", file=sys.stderr)
+        print(f"No se pudo cargar el modelo {CURRENT_MODEL_PATH}: {exc}", file=sys.stderr)
         return 1
 
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         print("No se pudo abrir la cámara (índice 0).", file=sys.stderr)
         return 1
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAP_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAP_HEIGHT)
 
     prev_time = time.time()
+    window_name = "NEXT2 VISION - ROTOR STUDIO"
+    canvas_size = (1280, 720)  # width, height
+    header_h = 40
+    footer_h = 180
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL | cv2.WINDOW_GUI_NORMAL)
+    cv2.resizeWindow(window_name, canvas_size[0], canvas_size[1])
+    frame_idx = 0
+    last_mask = None
+    last_boxes = None
 
     while True:
         frame = capture_frame(cap)
@@ -105,8 +256,15 @@ def main():
             print("Frame no capturado. Saliendo.", file=sys.stderr)
             break
 
-        mask = segment_people(frame, model)
-        composite = make_composite(frame, mask)
+        do_process = frame_idx % PROCESS_EVERY_N == 0 or last_mask is None
+        if do_process:
+            mask, boxes = segment_people(frame, model)
+            last_mask, last_boxes = mask, boxes
+        else:
+            mask, boxes = last_mask, last_boxes
+        frame_idx += 1
+
+        boxed = draw_boxes(frame, boxes)
 
         # FPS.
         now = time.time()
@@ -115,14 +273,48 @@ def main():
         fps = 1.0 / dt if dt > 0 else 0.0
         print(f"FPS: {fps:0.2f}", end="\r", flush=True)
 
-        original_with_fps = draw_fps(frame, fps)
+        # Composición en ventana única: dos vistas lado a lado ocupando todo el ancho.
+        canvas = np.zeros((canvas_size[1], canvas_size[0], 3), dtype=np.uint8)
+        view_h = canvas_size[1] - header_h - footer_h
+        half_w = canvas_size[0] // 2
 
-        cv2.imshow("original", original_with_fps)
-        cv2.imshow("mask", mask)
-        cv2.imshow("composite", composite)
+        left_view = fit_to_box(boxed, (half_w, view_h))
+        right_view = fit_to_box(cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR), (half_w, view_h))
 
-        if cv2.waitKey(1) & 0xFF == ord("q"):
+        left_view = add_overlay(left_view, "Original + Boxes")
+        right_view = add_overlay(right_view, "Mask")
+
+        canvas[header_h : header_h + left_view.shape[0], 0:half_w] = left_view
+        canvas[header_h : header_h + right_view.shape[0], half_w : half_w + right_view.shape[1]] = right_view
+
+        res_text = f"{frame.shape[1]}x{frame.shape[0]}"
+        people_count = len(boxes) if boxes is not None else 0
+        add_header(canvas, fps, DEVICE, res_text, people_count)
+        add_footer(canvas, CURRENT_MAX_HEIGHT)
+
+        cv2.imshow(window_name, canvas)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord("q"):
             break
+        # Resolución por teclas 1-5
+        if key in (ord("1"), ord("2"), ord("3"), ord("4"), ord("5")):
+            set_resolution_by_index(int(chr(key)) - 1)
+        # Cambio de modelo por teclas configuradas
+        if key in MODEL_OPTIONS:
+            try:
+                new_model = load_model(MODEL_OPTIONS[key][0])
+                CURRENT_MODEL_KEY = key
+                CURRENT_MODEL_PATH = MODEL_OPTIONS[key][0]
+                save_current_model()
+                model = new_model
+            except Exception as exc:
+                print(f"No se pudo cargar el modelo {MODEL_OPTIONS[key][0]}: {exc}", file=sys.stderr)
+        # Ajuste de límite de personas con +/- (teclado principal)
+        if key == ord("+") or key == ord("="):
+            CURRENT_PEOPLE_LIMIT = min(CURRENT_PEOPLE_LIMIT + 1, PEOPLE_LIMIT_OPTIONS[-1])
+        if key == ord("-"):
+            CURRENT_PEOPLE_LIMIT = max(CURRENT_PEOPLE_LIMIT - 1, PEOPLE_LIMIT_OPTIONS[0])
 
     cap.release()
     cv2.destroyAllWindows()
