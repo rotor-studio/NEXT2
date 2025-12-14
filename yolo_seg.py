@@ -181,8 +181,9 @@ def draw_boxes(frame: np.ndarray, boxes: np.ndarray) -> np.ndarray:
 def add_header(canvas: np.ndarray, fps: float, device: str, res_text: str, people_count: int, source_label: str) -> None:
     """Draw a single header line with source, resolution, FPS, device, model and people count at the top of the canvas."""
     current_model_label = MODEL_OPTIONS.get(CURRENT_MODEL_KEY, (CURRENT_MODEL_PATH, CURRENT_MODEL_PATH))[1]
+    fps_str = f"{fps:06.1f}"  # ancho fijo para evitar saltos en el texto
     text = (
-        f"SRC: {source_label} | RES: {res_text} | FPS: {fps:.1f} | GPU: {device} | "
+        f"SRC: {source_label} | RES: {res_text} | FPS: {fps_str} | GPU: {device} | "
         f"MODEL: {current_model_label} | PEOPLE NOW: {people_count} | PREC: {'HIGH' if HIGH_PRECISION_MODE else 'NORM'}"
     )
     cv2.putText(canvas, text, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
@@ -319,6 +320,7 @@ class NDIPublisher:
         self.name = name
         self.ndi = None
         self.sender = None
+        self.ready = False
         if not ENABLE_NDI:
             return
         try:
@@ -331,13 +333,14 @@ class NDIPublisher:
             send_settings.ndi_name = name
             self.sender = ndi.send_create(send_settings)
             self.ndi = ndi
+            self.ready = True
         except Exception as exc:
             print(f"[NDI] No disponible: {exc}", file=sys.stderr)
             self.sender = None
             self.ndi = None
 
     def publish(self, frame: np.ndarray):
-        if self.sender is None or self.ndi is None:
+        if self.sender is None or self.ndi is None or not self.ready:
             return
         try:
             ndi = self.ndi
