@@ -1,0 +1,11 @@
+{
+  "people_limit": 10,
+  "blur_kernel_idx": 0,
+  "blur_enabled": true,
+  "mask_thresh": 127,
+  "img_size_idx": 2,
+  "high_precision_mode": true,
+  "ndi_output_mask": "soft",
+  "source": "camera",
+  "show_detail": false
+}
