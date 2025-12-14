@@ -11,6 +11,8 @@ Controls
 - Model: `a`=yolov8n-seg (fast), `s`=yolov8s-seg (balanced), `d`=yolov8m-seg (heavier)
 - People limit (in-memory only): `+` / `-`
 - Source: `c`=camera, `v`=video (cycles through DATA/ videos, starts at first)
+- Mask blur: `o` / `p` to shrink/grow kernel, `b` toggle blur on/off
+- Mask threshold: `j` / `k` to lower/raise binarization threshold
 
 Persistence
 - Resolution persists in `resolution.txt`
