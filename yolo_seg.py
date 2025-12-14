@@ -230,7 +230,7 @@ def add_footer(canvas: np.ndarray, current_res: int) -> None:
     cv2.putText(canvas, imgsz_hint, (10, footer_y7),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
     hi_hint = f"HIGH PREC -> h ({'ON' if HIGH_PRECISION_MODE else 'OFF'}) | MASK VIEW -> m (soft/detail)"
-    cv2.putText(canvas, hi_hint, (10, footer_y7 + 30),
+    cv2.putText(canvas, hi_hint, (10, footer_y7 + 20),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
 
@@ -502,32 +502,36 @@ def main():
     last_mask_soft = None
     last_mask_detail = None
     last_boxes = None
+    last_frame = None
     show_detail = False
     ndi_pub = NDIPublisher("NEXT2 Mask NDI") if ENABLE_NDI else None
 
     while True:
         frame = capture_frame(cap)
+        got_new_frame = frame is not None
         if frame is None:
             if CURRENT_SOURCE == "video" and cap is not None:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 frame = capture_frame(cap)
+                got_new_frame = frame is not None
             elif CURRENT_SOURCE == "ndi":
-                # En NDI podemos simplemente seguir intentando en el siguiente loop.
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord("q"):
-                    break
+                # Mantener último frame o negro mientras esperamos señal NDI.
+                if last_frame is not None:
+                    frame = last_frame.copy()
                 else:
-                    continue
+                    frame = np.zeros((CURRENT_MAX_HEIGHT, int(CURRENT_MAX_HEIGHT * 16 / 9), 3), dtype=np.uint8)
+                got_new_frame = False
             if frame is None:
                 print("Frame no capturado. Saliendo.", file=sys.stderr)
                 break
 
-        do_process = frame_idx % PROCESS_EVERY_N == 0 or last_mask_soft is None
+        do_process = (frame_idx % PROCESS_EVERY_N == 0 or last_mask_soft is None) and got_new_frame
         if do_process:
             mask_soft, mask_detail, boxes = segment_people(
                 frame, model, CURRENT_PEOPLE_LIMIT, MASK_THRESH, BLUR_ENABLED
             )
             last_mask_soft, last_mask_detail, last_boxes = mask_soft, mask_detail, boxes
+            last_frame = frame
         else:
             mask_soft, mask_detail, boxes = last_mask_soft, last_mask_detail, last_boxes
         frame_idx += 1
@@ -617,9 +621,14 @@ def main():
             release_capture(cap)
             cap = open_capture(CURRENT_SOURCE)
         if key == ord("n") and ENABLE_NDI:
+            prev_cap, prev_src = cap, CURRENT_SOURCE
             CURRENT_SOURCE = "ndi"
             release_capture(cap)
             cap = open_capture(CURRENT_SOURCE)
+            if not capture_ready(cap):
+                print("[NDI] No se pudo abrir fuente NDI, se mantiene la anterior.", file=sys.stderr)
+                CURRENT_SOURCE = prev_src
+                cap = prev_cap
         # Modo alta precisión (usa imgsz máximo y detalle sin blur)
         if key == ord("h"):
             HIGH_PRECISION_MODE = not HIGH_PRECISION_MODE
