@@ -20,6 +20,7 @@ Controls
 Persistence
 - Resolution persists in `resolution.txt`
 - Model choice persists in `model.txt`
+- Runtime settings persist in `settings.json` (people limit, blur, threshold, imgsz, source, mask view, precision, etc.)
 
 Running
 - Conda env: `conda run -n NEXT python yolo_seg.py`

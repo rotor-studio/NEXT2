@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import sys
 import time
-from typing import Tuple
+from typing import Tuple, Any
 import os
 import multiprocessing as mp
 from pathlib import Path
@@ -60,6 +60,8 @@ MASK_THRESH = 127
 BLUR_ENABLED = True
 HIGH_PRECISION_MODE = False  # modo alta precisión (imgsz alto y sin blur en mask_detail)
 NDI_OUTPUT_MASK = "soft"  # "soft" o "detail"
+SHOW_DETAIL_DEFAULT = False
+SHOW_DETAIL = SHOW_DETAIL_DEFAULT
 
 # --------------- utils de captura y redimensionado -----------------
 def resize_keep_aspect(frame, max_height: int = 480):
@@ -409,6 +411,86 @@ def probe_ndi_available(timeout: float = 3.0) -> bool:
     return ok
 
 
+# --------------- persistencia de settings ---------------------------
+SETTINGS_FILE = Path(__file__).with_name("settings.json")
+
+
+def _clamp(val: int, low: int, high: int) -> int:
+    return max(low, min(high, val))
+
+
+def load_settings():
+    global CURRENT_PEOPLE_LIMIT, BLUR_KERNEL_IDX, BLUR_ENABLED, MASK_THRESH
+    global IMG_SIZE_IDX, HIGH_PRECISION_MODE, NDI_OUTPUT_MASK, CURRENT_SOURCE, SHOW_DETAIL
+    try:
+        import json
+
+        data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    try:
+        CURRENT_PEOPLE_LIMIT = _clamp(int(data.get("people_limit", CURRENT_PEOPLE_LIMIT)), PEOPLE_LIMIT_OPTIONS[0], PEOPLE_LIMIT_OPTIONS[-1])
+    except Exception:
+        pass
+    try:
+        BLUR_KERNEL_IDX = _clamp(int(data.get("blur_kernel_idx", BLUR_KERNEL_IDX)), 0, len(BLUR_KERNEL_OPTIONS) - 1)
+    except Exception:
+        pass
+    try:
+        BLUR_ENABLED = bool(data.get("blur_enabled", BLUR_ENABLED))
+    except Exception:
+        pass
+    try:
+        MASK_THRESH = _clamp(int(data.get("mask_thresh", MASK_THRESH)), 0, 255)
+    except Exception:
+        pass
+    try:
+        IMG_SIZE_IDX = _clamp(int(data.get("img_size_idx", IMG_SIZE_IDX)), 0, len(IMG_SIZE_OPTIONS) - 1)
+    except Exception:
+        pass
+    try:
+        HIGH_PRECISION_MODE = bool(data.get("high_precision_mode", HIGH_PRECISION_MODE))
+    except Exception:
+        pass
+    try:
+        if data.get("ndi_output_mask") in {"soft", "detail"}:
+            NDI_OUTPUT_MASK = data["ndi_output_mask"]
+    except Exception:
+        pass
+    try:
+        src = str(data.get("source", CURRENT_SOURCE)).lower()
+        if src in {"camera", "video", "ndi"}:
+            CURRENT_SOURCE = src
+    except Exception:
+        pass
+    try:
+        SHOW_DETAIL = bool(data.get("show_detail", SHOW_DETAIL_DEFAULT))
+    except Exception:
+        pass
+
+
+def save_settings(extra: dict[str, Any] | None = None):
+    base = {
+        "people_limit": CURRENT_PEOPLE_LIMIT,
+        "blur_kernel_idx": BLUR_KERNEL_IDX,
+        "blur_enabled": BLUR_ENABLED,
+        "mask_thresh": MASK_THRESH,
+        "img_size_idx": IMG_SIZE_IDX,
+        "high_precision_mode": HIGH_PRECISION_MODE,
+        "ndi_output_mask": NDI_OUTPUT_MASK,
+        "source": CURRENT_SOURCE,
+        "show_detail": SHOW_DETAIL,
+    }
+    if extra:
+        base.update(extra)
+    try:
+        import json
+
+        SETTINGS_FILE.write_text(json.dumps(base, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
 # --------------- Syphon (opcional) ----------------------------------
 class SyphonPublisher:
     """Wrapper para publicar frames por Syphon si la librería está disponible."""
@@ -584,9 +666,10 @@ def main():
     # Carga modelo YOLOv8 de segmentación (usa uno ligero por defecto).
     model_path = "yolov8n-seg.pt"
     global DEVICE, CURRENT_MODEL_PATH, CURRENT_MODEL_KEY, CURRENT_PEOPLE_LIMIT, CURRENT_SOURCE
-    global BLUR_KERNEL_IDX, MASK_THRESH, BLUR_ENABLED, IMG_SIZE_IDX, HIGH_PRECISION_MODE, ENABLE_NDI, DEFAULT_SOURCE
+    global BLUR_KERNEL_IDX, MASK_THRESH, BLUR_ENABLED, IMG_SIZE_IDX, HIGH_PRECISION_MODE, ENABLE_NDI, DEFAULT_SOURCE, SHOW_DETAIL
     load_saved_resolution()
     load_saved_model()
+    load_settings()
     env_device = os.environ.get("NEXT_DEVICE", "").strip().lower()
     if env_device and env_device != "auto":
         # Permite forzar cpu/mps/cuda manualmente.
@@ -642,7 +725,7 @@ def main():
     last_mask_detail = None
     last_boxes = None
     last_frame = None
-    show_detail = False
+    show_detail = SHOW_DETAIL
     ndi_pub = NDIPublisher("NEXT2 Mask NDI") if ENABLE_NDI and ENABLE_NDI_OUTPUT else None
 
     while True:
@@ -728,6 +811,7 @@ def main():
         # Resolución por teclas 1-5
         if key in (ord("1"), ord("2"), ord("3"), ord("4"), ord("5")):
             set_resolution_by_index(int(chr(key)) - 1)
+            save_settings()
         # Cambio de modelo por teclas configuradas
         if key in MODEL_OPTIONS:
             try:
@@ -735,41 +819,53 @@ def main():
                 CURRENT_MODEL_KEY = key
                 CURRENT_MODEL_PATH = MODEL_OPTIONS[key][0]
                 save_current_model()
+                save_settings()
                 model = new_model
             except Exception as exc:
                 print(f"No se pudo cargar el modelo {MODEL_OPTIONS[key][0]}: {exc}", file=sys.stderr)
         # Ajuste de límite de personas con +/- (teclado principal)
         if key == ord("+") or key == ord("="):
             CURRENT_PEOPLE_LIMIT = min(CURRENT_PEOPLE_LIMIT + 1, PEOPLE_LIMIT_OPTIONS[-1])
+            save_settings()
         if key == ord("-"):
             CURRENT_PEOPLE_LIMIT = max(CURRENT_PEOPLE_LIMIT - 1, PEOPLE_LIMIT_OPTIONS[0])
+            save_settings()
         # Ajuste de blur (detallado de silueta)
         if key == ord("o"):
             BLUR_KERNEL_IDX = max(0, BLUR_KERNEL_IDX - 1)
+            save_settings()
         if key == ord("p"):
             BLUR_KERNEL_IDX = min(len(BLUR_KERNEL_OPTIONS) - 1, BLUR_KERNEL_IDX + 1)
+            save_settings()
         if key == ord("b"):
             BLUR_ENABLED = not BLUR_ENABLED
+            save_settings()
         # Ajuste de threshold de binarización
         if key == ord("j"):
             MASK_THRESH = max(0, MASK_THRESH - 5)
+            save_settings()
         if key == ord("k"):
             MASK_THRESH = min(255, MASK_THRESH + 5)
+            save_settings()
         # Ajuste de imgsz (resolución de inferencia)
         if key == ord(","):
             IMG_SIZE_IDX = max(0, IMG_SIZE_IDX - 1)
+            save_settings()
         if key == ord("."):
             IMG_SIZE_IDX = min(len(IMG_SIZE_OPTIONS) - 1, IMG_SIZE_IDX + 1)
+            save_settings()
         # Cambio de fuente
         if key == ord("c"):
             CURRENT_SOURCE = "camera"
             release_capture(cap)
             cap = open_capture(CURRENT_SOURCE)
+            save_settings()
         if key == ord("v") and VIDEO_FILES:
             CURRENT_SOURCE = "video"
             CURRENT_VIDEO_INDEX = 0
             release_capture(cap)
             cap = open_capture(CURRENT_SOURCE)
+            save_settings()
         if key == ord("n") and ENABLE_NDI:
             prev_cap, prev_src = cap, CURRENT_SOURCE
             CURRENT_SOURCE = "ndi"
@@ -779,12 +875,16 @@ def main():
                 print("[NDI] No se pudo abrir fuente NDI, se mantiene la anterior.", file=sys.stderr)
                 CURRENT_SOURCE = prev_src
                 cap = prev_cap
+            save_settings()
         # Modo alta precisión (usa imgsz máximo y detalle sin blur)
         if key == ord("h"):
             HIGH_PRECISION_MODE = not HIGH_PRECISION_MODE
+            save_settings()
         # Toggle de máscara mostrada (soft/detail)
         if key == ord("m"):
             show_detail = not show_detail
+            SHOW_DETAIL = show_detail
+            save_settings()
 
     cap.release()
     cv2.destroyAllWindows()
