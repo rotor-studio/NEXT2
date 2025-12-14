@@ -40,6 +40,8 @@ VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv"}
 VIDEO_FILES = sorted([p for p in DATA_DIR.glob("*") if p.suffix.lower() in VIDEO_EXTS])
 CURRENT_SOURCE = "camera"  # "camera" o "video"
 CURRENT_VIDEO_INDEX = 0
+BLUR_KERNEL_OPTIONS = [1, 3, 5, 7, 9, 11, 13]
+BLUR_KERNEL_IDX = 2  # valor inicial -> kernel 5
 
 # --------------- utils de captura y redimensionado -----------------
 def resize_keep_aspect(frame, max_height: int = 480):
@@ -94,9 +96,11 @@ def segment_people(frame: np.ndarray, model: YOLO) -> Tuple[np.ndarray, np.ndarr
             continue
         person_boxes.append(box)
 
-    # Suavizado para silueta más orgánica.
-    person_mask = cv2.GaussianBlur(person_mask, (5, 5), 0)
-    _, person_mask = cv2.threshold(person_mask, 127, 255, cv2.THRESH_BINARY)
+    # Suavizado configurable.
+    ksize = BLUR_KERNEL_OPTIONS[BLUR_KERNEL_IDX]
+    if ksize > 1:
+        person_mask = cv2.GaussianBlur(person_mask, (ksize, ksize), 0)
+        _, person_mask = cv2.threshold(person_mask, 127, 255, cv2.THRESH_BINARY)
     return person_mask, np.array(person_boxes)
 
 
@@ -153,10 +157,12 @@ def add_header(canvas: np.ndarray, fps: float, device: str, res_text: str, peopl
 
 def add_footer(canvas: np.ndarray, current_res: int) -> None:
     """Draw footer with resolution selector hint."""
-    footer_y1 = canvas.shape[0] - 170
-    footer_y2 = canvas.shape[0] - 140
-    footer_y3 = canvas.shape[0] - 110
-    footer_y4 = canvas.shape[0] - 80
+    footer_y1 = canvas.shape[0] - 190
+    footer_y2 = canvas.shape[0] - 160
+    footer_y3 = canvas.shape[0] - 130
+    footer_y4 = canvas.shape[0] - 100
+    footer_y5 = canvas.shape[0] - 70
+    footer_y5 = canvas.shape[0] - 50
     res_opts = " | ".join(f"{i+1}:{r}" for i, r in enumerate(RES_OPTIONS))
     model_opts = " | ".join(f"{chr(k)}:{v[0]}" for k, v in MODEL_OPTIONS.items())
     cv2.putText(canvas, f"RES -> {res_opts} ", (10, footer_y1),
@@ -168,6 +174,9 @@ def add_footer(canvas: np.ndarray, current_res: int) -> None:
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
     source_hint = "SRC -> c:camara" + (" | v:video" if VIDEO_FILES else "")
     cv2.putText(canvas, source_hint, (10, footer_y4),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+    blur_hint = f"BLUR -> [:menos] ][mas] (ksize={BLUR_KERNEL_OPTIONS[BLUR_KERNEL_IDX]})"
+    cv2.putText(canvas, blur_hint, (10, footer_y5),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
 
 
@@ -314,7 +323,7 @@ class NDIPublisher:
 def main():
     # Carga modelo YOLOv8 de segmentación (usa uno ligero por defecto).
     model_path = "yolov8n-seg.pt"
-    global DEVICE, CURRENT_MODEL_PATH, CURRENT_MODEL_KEY, CURRENT_PEOPLE_LIMIT, CURRENT_SOURCE
+    global DEVICE, CURRENT_MODEL_PATH, CURRENT_MODEL_KEY, CURRENT_PEOPLE_LIMIT, CURRENT_SOURCE, BLUR_KERNEL_IDX
     load_saved_resolution()
     load_saved_model()
     if torch.backends.mps.is_available():
@@ -420,6 +429,11 @@ def main():
             CURRENT_PEOPLE_LIMIT = min(CURRENT_PEOPLE_LIMIT + 1, PEOPLE_LIMIT_OPTIONS[-1])
         if key == ord("-"):
             CURRENT_PEOPLE_LIMIT = max(CURRENT_PEOPLE_LIMIT - 1, PEOPLE_LIMIT_OPTIONS[0])
+        # Ajuste de blur (detallado de silueta)
+        if key == ord("["):
+            BLUR_KERNEL_IDX = max(0, BLUR_KERNEL_IDX - 1)
+        if key == ord("]"):
+            BLUR_KERNEL_IDX = min(len(BLUR_KERNEL_OPTIONS) - 1, BLUR_KERNEL_IDX + 1)
         # Cambio de fuente
         if key == ord("c"):
             CURRENT_SOURCE = "camera"
