@@ -190,37 +190,37 @@ def add_header(canvas: np.ndarray, fps: float, device: str, res_text: str, peopl
 
 def add_footer(canvas: np.ndarray, current_res: int) -> None:
     """Draw footer with resolution selector hint."""
-    footer_y1 = canvas.shape[0] - 190
-    footer_y2 = canvas.shape[0] - 160
-    footer_y3 = canvas.shape[0] - 130
-    footer_y4 = canvas.shape[0] - 100
-    footer_y5 = canvas.shape[0] - 70
-    footer_y6 = canvas.shape[0] - 40
-    footer_y7 = canvas.shape[0] - 10
+    footer_y1 = canvas.shape[0] - 220
+    footer_y2 = canvas.shape[0] - 190
+    footer_y3 = canvas.shape[0] - 160
+    footer_y4 = canvas.shape[0] - 130
+    footer_y5 = canvas.shape[0] - 100
+    footer_y6 = canvas.shape[0] - 70
+    footer_y7 = canvas.shape[0] - 40
     res_opts = " | ".join(f"{i+1}:{r}" for i, r in enumerate(RES_OPTIONS))
     model_opts = " | ".join(f"{chr(k)}:{v[0]}" for k, v in MODEL_OPTIONS.items())
     cv2.putText(canvas, f"RES -> {res_opts} ", (10, footer_y1),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
     current_model_label = MODEL_OPTIONS.get(CURRENT_MODEL_KEY, ("", ""))[1]
     cv2.putText(canvas, f"MODEL -> {model_opts} ", (10, footer_y2),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
     cv2.putText(canvas, f"PEOPLE -> +/- (limit={CURRENT_PEOPLE_LIMIT})", (10, footer_y3),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
     source_hint = "SRC -> c:camara" + (" | v:video" if VIDEO_FILES else "")
     cv2.putText(canvas, source_hint, (10, footer_y4),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
     blur_hint = f"BLUR -> o / p (ksize={BLUR_KERNEL_OPTIONS[BLUR_KERNEL_IDX]}) | b: {'ON' if BLUR_ENABLED else 'OFF'}"
     cv2.putText(canvas, blur_hint, (10, footer_y5),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
     thresh_hint = f"THRESH -> j/k (val={MASK_THRESH})"
     cv2.putText(canvas, thresh_hint, (10, footer_y6),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
     imgsz_hint = f"IMG_SZ -> , / . (imgsz={IMG_SIZE_OPTIONS[IMG_SIZE_IDX]})"
     cv2.putText(canvas, imgsz_hint, (10, footer_y7),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
     hi_hint = f"HIGH PREC -> h ({'ON' if HIGH_PRECISION_MODE else 'OFF'}) | MASK VIEW -> m (soft/detail)"
     cv2.putText(canvas, hi_hint, (10, footer_y7 + 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
 
 def set_resolution_by_index(idx: int):
@@ -366,7 +366,8 @@ class NDIPublisher:
 def main():
     # Carga modelo YOLOv8 de segmentación (usa uno ligero por defecto).
     model_path = "yolov8n-seg.pt"
-    global DEVICE, CURRENT_MODEL_PATH, CURRENT_MODEL_KEY, CURRENT_PEOPLE_LIMIT, CURRENT_SOURCE, BLUR_KERNEL_IDX, MASK_THRESH, BLUR_ENABLED, IMG_SIZE_IDX
+    global DEVICE, CURRENT_MODEL_PATH, CURRENT_MODEL_KEY, CURRENT_PEOPLE_LIMIT, CURRENT_SOURCE
+    global BLUR_KERNEL_IDX, MASK_THRESH, BLUR_ENABLED, IMG_SIZE_IDX, HIGH_PRECISION_MODE
     load_saved_resolution()
     load_saved_model()
     if torch.backends.mps.is_available():
