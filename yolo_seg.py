@@ -39,7 +39,7 @@ ENABLE_NDI = True     # Envía la máscara por NDI
 DATA_DIR = Path(__file__).with_name("DATA")
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv"}
 VIDEO_FILES = sorted([p for p in DATA_DIR.glob("*") if p.suffix.lower() in VIDEO_EXTS])
-CURRENT_SOURCE = "camera"  # "camera" o "video"
+CURRENT_SOURCE = "camera"  # "camera", "video" o "ndi"
 CURRENT_VIDEO_INDEX = 0
 BLUR_KERNEL_OPTIONS = [1, 3, 5, 7, 9, 11, 13]
 BLUR_KERNEL_IDX = 2  # valor inicial -> kernel 5
@@ -61,6 +61,11 @@ def resize_keep_aspect(frame, max_height: int = 480):
 
 def capture_frame(cap: cv2.VideoCapture):
     """Capture and resize a frame; returns None if capture fails."""
+    if isinstance(cap, NDIReceiver):
+        frame = cap.capture()
+        if frame is None:
+            return None
+        return resize_keep_aspect(frame, max_height=CURRENT_MAX_HEIGHT)
     ok, frame = cap.read()
     if not ok:
         return None
@@ -207,7 +212,12 @@ def add_footer(canvas: np.ndarray, current_res: int) -> None:
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
     cv2.putText(canvas, f"PEOPLE -> +/- (limit={CURRENT_PEOPLE_LIMIT})", (10, footer_y3),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-    source_hint = "SRC -> c:camara" + (" | v:video" if VIDEO_FILES else "")
+    src_opts = ["c:camara"]
+    if VIDEO_FILES:
+        src_opts.append("v:video")
+    if ENABLE_NDI:
+        src_opts.append("n:ndi")
+    source_hint = "SRC -> " + " | ".join(src_opts)
     cv2.putText(canvas, source_hint, (10, footer_y4),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
     blur_hint = f"BLUR -> o / p (ksize={BLUR_KERNEL_OPTIONS[BLUR_KERNEL_IDX]}) | b: {'ON' if BLUR_ENABLED else 'OFF'}"
@@ -291,6 +301,8 @@ def open_capture(source: str):
     path = VIDEO_FILES[CURRENT_VIDEO_INDEX]
     cap = cv2.VideoCapture(str(path))
     return cap
+    if source == "ndi":
+        return NDIReceiver()
 
 
 def source_label():
@@ -298,6 +310,8 @@ def source_label():
         return "Camera"
     if VIDEO_FILES:
         return f"Video: {VIDEO_FILES[CURRENT_VIDEO_INDEX].name}"
+    if CURRENT_SOURCE == "ndi":
+        return "NDI"
     return "Video"
 
 
@@ -363,6 +377,68 @@ class NDIPublisher:
             ndi.send_send_video_v2(self.sender, video_frame)
         except Exception as exc:
             print(f"[NDI] Error al publicar: {exc}", file=sys.stderr)
+
+
+class NDIReceiver:
+    """Wrapper para recibir frames por NDI."""
+
+    def __init__(self, source_name: str | None = None):
+        self.ndi = None
+        self.recv = None
+        self.ready = False
+        if not ENABLE_NDI:
+            return
+        try:
+            import NDIlib as ndi  # type: ignore
+            if not ndi.initialize():
+                print("[NDI] No se pudo inicializar NDIlib para entrada.", file=sys.stderr)
+                return
+            # Buscar fuente si no se especifica.
+            if source_name is None:
+                finder = ndi.find_create_v2()
+                ndi.find_wait_for_sources(finder, 2000)
+                sources = ndi.find_get_current_sources(finder)
+                if sources and len(sources) > 0:
+                    source_name = sources[0].ndi_name
+                ndi.find_destroy(finder)
+            if source_name is None:
+                print("[NDI] No se encontraron fuentes NDI.", file=sys.stderr)
+                return
+
+            recv_settings = ndi.RecvCreateV3()
+            recv_settings.color_format = ndi.RECV_COLOR_FORMAT_BGRX_BGRA
+            recv_settings.allow_video_fields = False
+            recv_settings.source_to_connect_to = ndi.Source(source_name, None)
+            self.recv = ndi.recv_create_v3(recv_settings)
+            self.ndi = ndi
+            self.ready = True
+        except Exception as exc:
+            print(f"[NDI] No se pudo preparar la entrada NDI: {exc}", file=sys.stderr)
+            self.ndi = None
+            self.recv = None
+            self.ready = False
+
+    def capture(self):
+        """Returns BGR frame or None if not available."""
+        if not self.ready or self.recv is None or self.ndi is None:
+            return None
+        ndi = self.ndi
+        try:
+            frame_type, video_frame, _, _ = ndi.recv_capture_v2(self.recv, 0)
+            if frame_type == ndi.FRAME_TYPE_NONE:
+                return None
+            if frame_type != ndi.FRAME_TYPE_VIDEO:
+                return None
+            h, w = video_frame.yres, video_frame.xres
+            # video_frame.data is bytes; interpret as BGRA then drop alpha.
+            data = np.frombuffer(video_frame.data, dtype=np.uint8)
+            frame_bgra = data.reshape((h, video_frame.line_stride_in_bytes // 4, 4))
+            frame_bgr = frame_bgra[:, :w, :3].copy()
+            ndi.recv_free_video_v2(self.recv, video_frame)
+            return frame_bgr
+        except Exception as exc:
+            print(f"[NDI] Error al recibir: {exc}", file=sys.stderr)
+            return None
 
 
 # --------------- loop principal ------------------------------------
@@ -508,6 +584,11 @@ def main():
         if key == ord("v") and VIDEO_FILES:
             CURRENT_SOURCE = "video"
             CURRENT_VIDEO_INDEX = 0
+            if cap:
+                cap.release()
+            cap = open_capture(CURRENT_SOURCE)
+        if key == ord("n") and ENABLE_NDI:
+            CURRENT_SOURCE = "ndi"
             if cap:
                 cap.release()
             cap = open_capture(CURRENT_SOURCE)
