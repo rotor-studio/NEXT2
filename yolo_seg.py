@@ -286,7 +286,7 @@ def load_model(path: str):
 
 
 def open_capture(source: str):
-    """Open VideoCapture for camera or current video."""
+    """Open capture for camera, video file, or NDI."""
     global CURRENT_VIDEO_INDEX
     if source == "camera":
         cap = cv2.VideoCapture(0)
@@ -294,15 +294,17 @@ def open_capture(source: str):
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAP_WIDTH)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAP_HEIGHT)
         return cap
-    if not VIDEO_FILES:
-        print("No hay videos en DATA/", file=sys.stderr)
-        return None
-    CURRENT_VIDEO_INDEX %= len(VIDEO_FILES)
-    path = VIDEO_FILES[CURRENT_VIDEO_INDEX]
-    cap = cv2.VideoCapture(str(path))
-    return cap
     if source == "ndi":
         return NDIReceiver()
+    if source == "video":
+        if not VIDEO_FILES:
+            print("No hay videos en DATA/", file=sys.stderr)
+            return None
+        CURRENT_VIDEO_INDEX %= len(VIDEO_FILES)
+        path = VIDEO_FILES[CURRENT_VIDEO_INDEX]
+        cap = cv2.VideoCapture(str(path))
+        return cap
+    return None
 
 
 def source_label():
@@ -313,6 +315,24 @@ def source_label():
     if CURRENT_SOURCE == "ndi":
         return "NDI"
     return "Video"
+
+
+def capture_ready(cap):
+    if cap is None:
+        return False
+    if isinstance(cap, NDIReceiver):
+        return cap.ready
+    return cap.isOpened()
+
+
+def release_capture(cap):
+    if cap is None:
+        return
+    if hasattr(cap, "release"):
+        try:
+            cap.release()
+        except Exception:
+            pass
 
 
 # --------------- Syphon (opcional) ----------------------------------
@@ -440,6 +460,10 @@ class NDIReceiver:
             print(f"[NDI] Error al recibir: {exc}", file=sys.stderr)
             return None
 
+    def release(self):
+        # No-op for NDI receiver; placeholder for interface compatibility.
+        return
+
 
 # --------------- loop principal ------------------------------------
 def main():
@@ -463,7 +487,7 @@ def main():
         return 1
 
     cap = open_capture(CURRENT_SOURCE)
-    if cap is None or not cap.isOpened():
+    if not capture_ready(cap):
         print("No se pudo abrir la fuente de video.", file=sys.stderr)
         return 1
 
@@ -487,6 +511,13 @@ def main():
             if CURRENT_SOURCE == "video" and cap is not None:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 frame = capture_frame(cap)
+            elif CURRENT_SOURCE == "ndi":
+                # En NDI podemos simplemente seguir intentando en el siguiente loop.
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("q"):
+                    break
+                else:
+                    continue
             if frame is None:
                 print("Frame no capturado. Saliendo.", file=sys.stderr)
                 break
@@ -578,19 +609,16 @@ def main():
         # Cambio de fuente
         if key == ord("c"):
             CURRENT_SOURCE = "camera"
-            if cap:
-                cap.release()
+            release_capture(cap)
             cap = open_capture(CURRENT_SOURCE)
         if key == ord("v") and VIDEO_FILES:
             CURRENT_SOURCE = "video"
             CURRENT_VIDEO_INDEX = 0
-            if cap:
-                cap.release()
+            release_capture(cap)
             cap = open_capture(CURRENT_SOURCE)
         if key == ord("n") and ENABLE_NDI:
             CURRENT_SOURCE = "ndi"
-            if cap:
-                cap.release()
+            release_capture(cap)
             cap = open_capture(CURRENT_SOURCE)
         # Modo alta precisión (usa imgsz máximo y detalle sin blur)
         if key == ord("h"):
