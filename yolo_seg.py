@@ -45,6 +45,8 @@ BLUR_KERNEL_OPTIONS = [1, 3, 5, 7, 9, 11, 13]
 BLUR_KERNEL_IDX = 2  # valor inicial -> kernel 5
 MASK_THRESH = 127
 BLUR_ENABLED = True
+HIGH_PRECISION_MODE = False  # modo alta precisión (imgsz alto y sin blur en mask_detail)
+NDI_OUTPUT_MASK = "soft"  # "soft" o "detail"
 
 # --------------- utils de captura y redimensionado -----------------
 def resize_keep_aspect(frame, max_height: int = 480):
@@ -66,21 +68,28 @@ def capture_frame(cap: cv2.VideoCapture):
 
 
 # --------------- segmentación --------------------------------------
-def segment_people(frame: np.ndarray, model: YOLO, people_limit: int, mask_thresh: int, blur_enabled: bool) -> Tuple[np.ndarray, np.ndarray]:
+def segment_people(frame: np.ndarray, model: YOLO, people_limit: int, mask_thresh: int, blur_enabled: bool) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Run YOLOv8 segmentation and return:
-    - mask: global person mask (0-255, uint8) resized to frame size.
+    - mask_soft: smoothed binary mask (uint8) suitable for NDI/output.
+    - mask_detail: sharper binary mask (uint8) preserving fine contours.
     - boxes: ndarray of person boxes (N, 4) in xyxy format.
-    - Combines all person masks with bitwise OR.
-    - Returns all-black mask if no persons are found.
+    mask_detail generation:
+      * Resize masks with linear interpolation for smoother edges.
+      * Aggregate per-pixel max over persons (filtered by limit).
+      * Optional light morphology to clean speckles.
+      * Threshold with user-defined value.
+    mask_soft generation:
+      * Derived from mask_detail, optional Gaussian blur, re-threshold, optional light closing.
     """
     h, w = frame.shape[:2]
-    imgsz = IMG_SIZE_OPTIONS[IMG_SIZE_IDX]
+    imgsz = max(IMG_SIZE_OPTIONS) if HIGH_PRECISION_MODE else IMG_SIZE_OPTIONS[IMG_SIZE_IDX]
     result = model(frame, imgsz=imgsz, verbose=False, device=DEVICE)[0]
 
     # If the model returns no masks, bail early.
     if result.masks is None or result.boxes is None:
-        return np.zeros((h, w), dtype=np.uint8), np.empty((0, 4))
+        empty = np.zeros((h, w), dtype=np.uint8)
+        return empty, empty, np.empty((0, 4))
 
     masks = result.masks.data.cpu().numpy()  # shape: (N, H, W) in model space
     classes = result.boxes.cls.cpu().numpy().astype(int)  # shape: (N,)
@@ -90,25 +99,42 @@ def segment_people(frame: np.ndarray, model: YOLO, people_limit: int, mask_thres
     # Filtrar solo personas y aplicar límite ordenando por confianza.
     person_indices = [i for i, cls_id in enumerate(classes) if cls_id == 0]
     if not person_indices:
-        return np.zeros((h, w), dtype=np.uint8), np.empty((0, 4))
+        empty = np.zeros((h, w), dtype=np.uint8)
+        return empty, empty, np.empty((0, 4))
     person_indices = sorted(person_indices, key=lambda i: confs[i], reverse=True)[:people_limit]
 
-    person_mask = np.zeros((h, w), dtype=np.uint8)
+    # Aggregate soft mask (float) to keep fine contours before thresholding.
+    person_mask = np.zeros((h, w), dtype=np.float32)
     person_boxes = []
     for idx in person_indices:
         m = masks[idx]
-        # Resize mask from model space to frame space and scale to 0-255 for flexible thresholding.
+        # Resize mask from model space to frame space; keep float precision for later threshold.
         m_resized = cv2.resize(m, (w, h), interpolation=cv2.INTER_LINEAR)
-        m_uint8 = np.clip(m_resized * 255.0, 0, 255).astype(np.uint8)
-        person_mask = cv2.bitwise_or(person_mask, m_uint8)
+        person_mask = np.maximum(person_mask, m_resized)
         person_boxes.append(boxes_all[idx])
 
-    # Suavizado configurable.
+    # Convert to uint8 scale 0-255 for morphology/thresholding.
+    person_mask_u8 = np.clip(person_mask * 255.0, 0, 255).astype(np.uint8)
+
+    # Morphology to clean speckles while preserving contour.
+    morph_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    person_mask_u8 = cv2.morphologyEx(person_mask_u8, cv2.MORPH_OPEN, morph_kernel, iterations=1)
+    person_mask_u8 = cv2.morphologyEx(person_mask_u8, cv2.MORPH_CLOSE, morph_kernel, iterations=1)
+
+    # mask_detail: threshold with minimal blur (none by default).
+    mask_detail = person_mask_u8.copy()
+    _, mask_detail = cv2.threshold(mask_detail, mask_thresh, 255, cv2.THRESH_BINARY)
+
+    # mask_soft: derived from mask_detail, optional blur + closing to smooth edges.
+    mask_soft = mask_detail.copy()
     ksize = BLUR_KERNEL_OPTIONS[BLUR_KERNEL_IDX]
     if blur_enabled and ksize > 1:
-        person_mask = cv2.GaussianBlur(person_mask, (ksize, ksize), 0)
-    _, person_mask = cv2.threshold(person_mask, mask_thresh, 255, cv2.THRESH_BINARY)
-    return person_mask, np.array(person_boxes)
+        mask_soft = cv2.GaussianBlur(mask_soft, (ksize, ksize), 0)
+        _, mask_soft = cv2.threshold(mask_soft, mask_thresh, 255, cv2.THRESH_BINARY)
+    # Light closing to reduce jaggies without over-rounding.
+    mask_soft = cv2.morphologyEx(mask_soft, cv2.MORPH_CLOSE, morph_kernel, iterations=1)
+
+    return mask_soft, mask_detail, np.array(person_boxes)
 
 
 # --------------- composición y overlays ----------------------------
@@ -157,7 +183,7 @@ def add_header(canvas: np.ndarray, fps: float, device: str, res_text: str, peopl
     current_model_label = MODEL_OPTIONS.get(CURRENT_MODEL_KEY, (CURRENT_MODEL_PATH, CURRENT_MODEL_PATH))[1]
     text = (
         f"SRC: {source_label} | RES: {res_text} | FPS: {fps:.1f} | GPU: {device} | "
-        f"MODEL: {current_model_label} | PEOPLE NOW: {people_count}"
+        f"MODEL: {current_model_label} | PEOPLE NOW: {people_count} | PREC: {'HIGH' if HIGH_PRECISION_MODE else 'NORM'}"
     )
     cv2.putText(canvas, text, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
 
@@ -191,6 +217,9 @@ def add_footer(canvas: np.ndarray, current_res: int) -> None:
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
     imgsz_hint = f"IMG_SZ -> , / . (imgsz={IMG_SIZE_OPTIONS[IMG_SIZE_IDX]})"
     cv2.putText(canvas, imgsz_hint, (10, footer_y7),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+    hi_hint = f"HIGH PREC -> h ({'ON' if HIGH_PRECISION_MODE else 'OFF'}) | MASK VIEW -> m (soft/detail)"
+    cv2.putText(canvas, hi_hint, (10, footer_y7 + 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
 
 
@@ -362,12 +391,14 @@ def main():
     window_name = "NEXT2 VISION - ROTOR STUDIO"
     canvas_size = (1280, 720)  # width, height
     header_h = 40
-    footer_h = 230
+    footer_h = 260
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL | cv2.WINDOW_GUI_NORMAL)
     cv2.resizeWindow(window_name, canvas_size[0], canvas_size[1])
     frame_idx = 0
-    last_mask = None
+    last_mask_soft = None
+    last_mask_detail = None
     last_boxes = None
+    show_detail = False
     ndi_pub = NDIPublisher("NEXT2 Mask NDI") if ENABLE_NDI else None
 
     while True:
@@ -380,12 +411,14 @@ def main():
                 print("Frame no capturado. Saliendo.", file=sys.stderr)
                 break
 
-        do_process = frame_idx % PROCESS_EVERY_N == 0 or last_mask is None
+        do_process = frame_idx % PROCESS_EVERY_N == 0 or last_mask_soft is None
         if do_process:
-            mask, boxes = segment_people(frame, model, CURRENT_PEOPLE_LIMIT, MASK_THRESH, BLUR_ENABLED)
-            last_mask, last_boxes = mask, boxes
+            mask_soft, mask_detail, boxes = segment_people(
+                frame, model, CURRENT_PEOPLE_LIMIT, MASK_THRESH, BLUR_ENABLED
+            )
+            last_mask_soft, last_mask_detail, last_boxes = mask_soft, mask_detail, boxes
         else:
-            mask, boxes = last_mask, last_boxes
+            mask_soft, mask_detail, boxes = last_mask_soft, last_mask_detail, last_boxes
         frame_idx += 1
 
         boxed = draw_boxes(frame, boxes)
@@ -403,10 +436,11 @@ def main():
         half_w = canvas_size[0] // 2
 
         left_view = fit_to_box(boxed, (half_w, view_h))
-        right_view = fit_to_box(cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR), (half_w, view_h))
+        mask_to_show = mask_detail if show_detail else mask_soft
+        right_view = fit_to_box(cv2.cvtColor(mask_to_show, cv2.COLOR_GRAY2BGR), (half_w, view_h))
 
         left_view = add_overlay(left_view, "Original + Boxes")
-        right_view = add_overlay(right_view, "Mask")
+        right_view = add_overlay(right_view, "Mask Detail" if show_detail else "Mask Soft")
 
         canvas[header_h : header_h + left_view.shape[0], 0:half_w] = left_view
         canvas[header_h : header_h + right_view.shape[0], half_w : half_w + right_view.shape[1]] = right_view
@@ -416,9 +450,10 @@ def main():
         add_header(canvas, fps, DEVICE, res_text, people_count, source_label())
         add_footer(canvas, CURRENT_MAX_HEIGHT)
 
-        # Publicación NDI (máscara)
+        # Publicación NDI (máscara) - por defecto la suave; cambiar a mask_detail si se desea.
         if ndi_pub is not None:
-            ndi_pub.publish(mask)
+            mask_out = mask_soft if NDI_OUTPUT_MASK == "soft" else mask_detail
+            ndi_pub.publish(mask_out)
 
         cv2.imshow(window_name, canvas)
 
@@ -472,6 +507,12 @@ def main():
             if cap:
                 cap.release()
             cap = open_capture(CURRENT_SOURCE)
+        # Modo alta precisión (usa imgsz máximo y detalle sin blur)
+        if key == ord("h"):
+            HIGH_PRECISION_MODE = not HIGH_PRECISION_MODE
+        # Toggle de máscara mostrada (soft/detail)
+        if key == ord("m"):
+            show_detail = not show_detail
 
     cap.release()
     cv2.destroyAllWindows()
