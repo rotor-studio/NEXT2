@@ -35,6 +35,11 @@ CURRENT_MODEL_PATH = MODEL_OPTIONS[CURRENT_MODEL_KEY][0]
 PEOPLE_LIMIT_OPTIONS = list(range(1, 21))
 CURRENT_PEOPLE_LIMIT = 10
 ENABLE_NDI = True     # Envía la máscara por NDI
+DATA_DIR = Path(__file__).with_name("DATA")
+VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv"}
+VIDEO_FILES = sorted([p for p in DATA_DIR.glob("*") if p.suffix.lower() in VIDEO_EXTS])
+CURRENT_SOURCE = "camera"  # "camera" o "video"
+CURRENT_VIDEO_INDEX = 0
 
 # --------------- utils de captura y redimensionado -----------------
 def resize_keep_aspect(frame, max_height: int = 480):
@@ -136,11 +141,11 @@ def draw_boxes(frame: np.ndarray, boxes: np.ndarray) -> np.ndarray:
     return out
 
 
-def add_header(canvas: np.ndarray, fps: float, device: str, res_text: str, people_count: int) -> None:
-    """Draw a single header line with resolution, FPS, device, model and people count at the top of the canvas."""
+def add_header(canvas: np.ndarray, fps: float, device: str, res_text: str, people_count: int, source_label: str) -> None:
+    """Draw a single header line with source, resolution, FPS, device, model and people count at the top of the canvas."""
     current_model_label = MODEL_OPTIONS.get(CURRENT_MODEL_KEY, (CURRENT_MODEL_PATH, CURRENT_MODEL_PATH))[1]
     text = (
-        f"RES: {res_text} | FPS: {fps:.1f} | GPU: {device} | "
+        f"SRC: {source_label} | RES: {res_text} | FPS: {fps:.1f} | GPU: {device} | "
         f"MODEL: {current_model_label} | PEOPLE NOW: {people_count}"
     )
     cv2.putText(canvas, text, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
@@ -151,6 +156,7 @@ def add_footer(canvas: np.ndarray, current_res: int) -> None:
     footer_y1 = canvas.shape[0] - 170
     footer_y2 = canvas.shape[0] - 140
     footer_y3 = canvas.shape[0] - 110
+    footer_y4 = canvas.shape[0] - 80
     res_opts = " | ".join(f"{i+1}:{r}" for i, r in enumerate(RES_OPTIONS))
     model_opts = " | ".join(f"{chr(k)}:{v[0]}" for k, v in MODEL_OPTIONS.items())
     cv2.putText(canvas, f"RES -> {res_opts} ", (10, footer_y1),
@@ -159,6 +165,9 @@ def add_footer(canvas: np.ndarray, current_res: int) -> None:
     cv2.putText(canvas, f"MODEL -> {model_opts} ", (10, footer_y2),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
     cv2.putText(canvas, f"PEOPLE -> +/- (NOW: {CURRENT_PEOPLE_LIMIT})", (10, footer_y3),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+    source_hint = "SRC -> c:camara" + (" | v:video" if VIDEO_FILES else "")
+    cv2.putText(canvas, source_hint, (10, footer_y4),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
 
 
@@ -211,6 +220,32 @@ def load_model(path: str):
     mdl = YOLO(path)
     mdl.to(DEVICE)
     return mdl
+
+
+def open_capture(source: str):
+    """Open VideoCapture for camera or current video."""
+    global CURRENT_VIDEO_INDEX
+    if source == "camera":
+        cap = cv2.VideoCapture(0)
+        if cap.isOpened():
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAP_WIDTH)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAP_HEIGHT)
+        return cap
+    if not VIDEO_FILES:
+        print("No hay videos en DATA/", file=sys.stderr)
+        return None
+    CURRENT_VIDEO_INDEX %= len(VIDEO_FILES)
+    path = VIDEO_FILES[CURRENT_VIDEO_INDEX]
+    cap = cv2.VideoCapture(str(path))
+    return cap
+
+
+def source_label():
+    if CURRENT_SOURCE == "camera":
+        return "Camera"
+    if VIDEO_FILES:
+        return f"Video: {VIDEO_FILES[CURRENT_VIDEO_INDEX].name}"
+    return "Video"
 
 
 # --------------- Syphon (opcional) ----------------------------------
@@ -279,7 +314,7 @@ class NDIPublisher:
 def main():
     # Carga modelo YOLOv8 de segmentación (usa uno ligero por defecto).
     model_path = "yolov8n-seg.pt"
-    global DEVICE, CURRENT_MODEL_PATH, CURRENT_MODEL_KEY, CURRENT_PEOPLE_LIMIT
+    global DEVICE, CURRENT_MODEL_PATH, CURRENT_MODEL_KEY, CURRENT_PEOPLE_LIMIT, CURRENT_SOURCE
     load_saved_resolution()
     load_saved_model()
     if torch.backends.mps.is_available():
@@ -295,12 +330,10 @@ def main():
         print(f"No se pudo cargar el modelo {CURRENT_MODEL_PATH}: {exc}", file=sys.stderr)
         return 1
 
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("No se pudo abrir la cámara (índice 0).", file=sys.stderr)
+    cap = open_capture(CURRENT_SOURCE)
+    if cap is None or not cap.isOpened():
+        print("No se pudo abrir la fuente de video.", file=sys.stderr)
         return 1
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAP_WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAP_HEIGHT)
 
     prev_time = time.time()
     window_name = "NEXT2 VISION - ROTOR STUDIO"
@@ -317,8 +350,12 @@ def main():
     while True:
         frame = capture_frame(cap)
         if frame is None:
-            print("Frame no capturado. Saliendo.", file=sys.stderr)
-            break
+            if CURRENT_SOURCE == "video" and cap is not None:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                frame = capture_frame(cap)
+            if frame is None:
+                print("Frame no capturado. Saliendo.", file=sys.stderr)
+                break
 
         do_process = frame_idx % PROCESS_EVERY_N == 0 or last_mask is None
         if do_process:
@@ -353,7 +390,7 @@ def main():
 
         res_text = f"{frame.shape[1]}x{frame.shape[0]}"
         people_count = len(boxes) if boxes is not None else 0
-        add_header(canvas, fps, DEVICE, res_text, people_count)
+        add_header(canvas, fps, DEVICE, res_text, people_count, source_label())
         add_footer(canvas, CURRENT_MAX_HEIGHT)
 
         # Publicación NDI (máscara)
@@ -383,6 +420,18 @@ def main():
             CURRENT_PEOPLE_LIMIT = min(CURRENT_PEOPLE_LIMIT + 1, PEOPLE_LIMIT_OPTIONS[-1])
         if key == ord("-"):
             CURRENT_PEOPLE_LIMIT = max(CURRENT_PEOPLE_LIMIT - 1, PEOPLE_LIMIT_OPTIONS[0])
+        # Cambio de fuente
+        if key == ord("c"):
+            CURRENT_SOURCE = "camera"
+            if cap:
+                cap.release()
+            cap = open_capture(CURRENT_SOURCE)
+        if key == ord("v") and VIDEO_FILES:
+            CURRENT_SOURCE = "video"
+            CURRENT_VIDEO_INDEX = 0
+            if cap:
+                cap.release()
+            cap = open_capture(CURRENT_SOURCE)
 
     cap.release()
     cv2.destroyAllWindows()

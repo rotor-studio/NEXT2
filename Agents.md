@@ -10,6 +10,7 @@ Controls
 - Resolution (height): `1`=160, `2`=240, `3`=320, `4`=360, `5`=480
 - Model: `a`=yolov8n-seg (fast), `s`=yolov8s-seg (balanced), `d`=yolov8m-seg (heavier)
 - People limit (in-memory only): `+` / `-`
+- Source: `c`=camera, `v`=video (cycles through DATA/ videos, starts at first)
 
 Persistence
 - Resolution persists in `resolution.txt`
@@ -18,6 +19,7 @@ Persistence
 Running
 - Conda env: `conda run -n NEXT python yolo_seg.py`
 - Requires: `ultralytics`, `opencv-python`, `torch` (MPS/CPU auto-selected; CUDA if available)
+- NDI: publica la máscara como fuente “NEXT2 Mask NDI” (BGRA) si `ndi-python` está instalado.
 
 Performance tips
 - Lower resolution (1–3) for higher FPS.
