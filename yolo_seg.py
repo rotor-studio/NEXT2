@@ -165,7 +165,6 @@ def add_footer(canvas: np.ndarray, current_res: int) -> None:
     footer_y3 = canvas.shape[0] - 130
     footer_y4 = canvas.shape[0] - 100
     footer_y5 = canvas.shape[0] - 70
-    footer_y5 = canvas.shape[0] - 50
     res_opts = " | ".join(f"{i+1}:{r}" for i, r in enumerate(RES_OPTIONS))
     model_opts = " | ".join(f"{chr(k)}:{v[0]}" for k, v in MODEL_OPTIONS.items())
     cv2.putText(canvas, f"RES -> {res_opts} ", (10, footer_y1),
@@ -178,7 +177,7 @@ def add_footer(canvas: np.ndarray, current_res: int) -> None:
     source_hint = "SRC -> c:camara" + (" | v:video" if VIDEO_FILES else "")
     cv2.putText(canvas, source_hint, (10, footer_y4),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
-    blur_hint = f"BLUR -> [ / ] (ksize={BLUR_KERNEL_OPTIONS[BLUR_KERNEL_IDX]})"
+    blur_hint = f"BLUR -> o / p (ksize={BLUR_KERNEL_OPTIONS[BLUR_KERNEL_IDX]})"
     cv2.putText(canvas, blur_hint, (10, footer_y5),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
 
@@ -433,9 +432,9 @@ def main():
         if key == ord("-"):
             CURRENT_PEOPLE_LIMIT = max(CURRENT_PEOPLE_LIMIT - 1, PEOPLE_LIMIT_OPTIONS[0])
         # Ajuste de blur (detallado de silueta)
-        if key == ord("["):
+        if key == ord("o"):
             BLUR_KERNEL_IDX = max(0, BLUR_KERNEL_IDX - 1)
-        if key == ord("]"):
+        if key == ord("p"):
             BLUR_KERNEL_IDX = min(len(BLUR_KERNEL_OPTIONS) - 1, BLUR_KERNEL_IDX + 1)
         # Cambio de fuente
         if key == ord("c"):
