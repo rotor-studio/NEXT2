@@ -63,7 +63,7 @@ def capture_frame(cap: cv2.VideoCapture):
 
 
 # --------------- segmentación --------------------------------------
-def segment_people(frame: np.ndarray, model: YOLO) -> Tuple[np.ndarray, np.ndarray]:
+def segment_people(frame: np.ndarray, model: YOLO, people_limit: int) -> Tuple[np.ndarray, np.ndarray]:
     """
     Run YOLOv8 segmentation and return:
     - mask: global person mask (0-255, uint8) resized to frame size.
@@ -81,20 +81,23 @@ def segment_people(frame: np.ndarray, model: YOLO) -> Tuple[np.ndarray, np.ndarr
     masks = result.masks.data.cpu().numpy()  # shape: (N, H, W) in model space
     classes = result.boxes.cls.cpu().numpy().astype(int)  # shape: (N,)
     boxes_all = result.boxes.xyxy.cpu().numpy()
+    confs = result.boxes.conf.cpu().numpy()
+
+    # Filtrar solo personas y aplicar límite ordenando por confianza.
+    person_indices = [i for i, cls_id in enumerate(classes) if cls_id == 0]
+    if not person_indices:
+        return np.zeros((h, w), dtype=np.uint8), np.empty((0, 4))
+    person_indices = sorted(person_indices, key=lambda i: confs[i], reverse=True)[:people_limit]
 
     person_mask = np.zeros((h, w), dtype=np.uint8)
     person_boxes = []
-    for m, cls_id in zip(masks, classes):
-        if cls_id != 0:  # 0 is "person" in COCO
-            continue
+    for idx in person_indices:
+        m = masks[idx]
         # Resize mask from model space to frame space.
         m_resized = cv2.resize(m, (w, h), interpolation=cv2.INTER_NEAREST)
         m_bin = (m_resized > 0.5).astype(np.uint8) * 255
         person_mask = cv2.bitwise_or(person_mask, m_bin.astype(np.uint8))
-    for cls_id, box in zip(classes, boxes_all):
-        if cls_id != 0:
-            continue
-        person_boxes.append(box)
+        person_boxes.append(boxes_all[idx])
 
     # Suavizado configurable.
     ksize = BLUR_KERNEL_OPTIONS[BLUR_KERNEL_IDX]
@@ -170,12 +173,12 @@ def add_footer(canvas: np.ndarray, current_res: int) -> None:
     current_model_label = MODEL_OPTIONS.get(CURRENT_MODEL_KEY, ("", ""))[1]
     cv2.putText(canvas, f"MODEL -> {model_opts} ", (10, footer_y2),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
-    cv2.putText(canvas, f"PEOPLE -> +/- (NOW: {CURRENT_PEOPLE_LIMIT})", (10, footer_y3),
+    cv2.putText(canvas, f"PEOPLE -> +/- (limit={CURRENT_PEOPLE_LIMIT})", (10, footer_y3),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
     source_hint = "SRC -> c:camara" + (" | v:video" if VIDEO_FILES else "")
     cv2.putText(canvas, source_hint, (10, footer_y4),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
-    blur_hint = f"BLUR -> [:menos] ][mas] (ksize={BLUR_KERNEL_OPTIONS[BLUR_KERNEL_IDX]})"
+    blur_hint = f"BLUR -> [ / ] (ksize={BLUR_KERNEL_OPTIONS[BLUR_KERNEL_IDX]})"
     cv2.putText(canvas, blur_hint, (10, footer_y5),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
 
@@ -368,7 +371,7 @@ def main():
 
         do_process = frame_idx % PROCESS_EVERY_N == 0 or last_mask is None
         if do_process:
-            mask, boxes = segment_people(frame, model)
+            mask, boxes = segment_people(frame, model, CURRENT_PEOPLE_LIMIT)
             last_mask, last_boxes = mask, boxes
         else:
             mask, boxes = last_mask, last_boxes
