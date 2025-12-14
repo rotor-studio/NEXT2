@@ -13,6 +13,9 @@ Controls
 - Source: `c`=camera, `v`=video (cycles through DATA/ videos, starts at first)
 - Mask blur: `o` / `p` to shrink/grow kernel, `b` toggle blur on/off
 - Mask threshold: `j` / `k` to lower/raise binarization threshold
+- Mask view: `m` toggles between soft/detail
+- Precision: `h` toggles high precision (uses max imgsz)
+- img size for YOLO: `,` / `.` cycle imgsz (320/480/640)
 
 Persistence
 - Resolution persists in `resolution.txt`
