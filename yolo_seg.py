@@ -42,6 +42,8 @@ CURRENT_SOURCE = "camera"  # "camera" o "video"
 CURRENT_VIDEO_INDEX = 0
 BLUR_KERNEL_OPTIONS = [1, 3, 5, 7, 9, 11, 13]
 BLUR_KERNEL_IDX = 2  # valor inicial -> kernel 5
+MASK_THRESH = 127
+BLUR_ENABLED = True
 
 # --------------- utils de captura y redimensionado -----------------
 def resize_keep_aspect(frame, max_height: int = 480):
@@ -63,7 +65,7 @@ def capture_frame(cap: cv2.VideoCapture):
 
 
 # --------------- segmentación --------------------------------------
-def segment_people(frame: np.ndarray, model: YOLO, people_limit: int) -> Tuple[np.ndarray, np.ndarray]:
+def segment_people(frame: np.ndarray, model: YOLO, people_limit: int, mask_thresh: int, blur_enabled: bool) -> Tuple[np.ndarray, np.ndarray]:
     """
     Run YOLOv8 segmentation and return:
     - mask: global person mask (0-255, uint8) resized to frame size.
@@ -101,9 +103,9 @@ def segment_people(frame: np.ndarray, model: YOLO, people_limit: int) -> Tuple[n
 
     # Suavizado configurable.
     ksize = BLUR_KERNEL_OPTIONS[BLUR_KERNEL_IDX]
-    if ksize > 1:
+    if blur_enabled and ksize > 1:
         person_mask = cv2.GaussianBlur(person_mask, (ksize, ksize), 0)
-        _, person_mask = cv2.threshold(person_mask, 127, 255, cv2.THRESH_BINARY)
+    _, person_mask = cv2.threshold(person_mask, mask_thresh, 255, cv2.THRESH_BINARY)
     return person_mask, np.array(person_boxes)
 
 
@@ -165,6 +167,7 @@ def add_footer(canvas: np.ndarray, current_res: int) -> None:
     footer_y3 = canvas.shape[0] - 130
     footer_y4 = canvas.shape[0] - 100
     footer_y5 = canvas.shape[0] - 70
+    footer_y6 = canvas.shape[0] - 40
     res_opts = " | ".join(f"{i+1}:{r}" for i, r in enumerate(RES_OPTIONS))
     model_opts = " | ".join(f"{chr(k)}:{v[0]}" for k, v in MODEL_OPTIONS.items())
     cv2.putText(canvas, f"RES -> {res_opts} ", (10, footer_y1),
@@ -177,8 +180,11 @@ def add_footer(canvas: np.ndarray, current_res: int) -> None:
     source_hint = "SRC -> c:camara" + (" | v:video" if VIDEO_FILES else "")
     cv2.putText(canvas, source_hint, (10, footer_y4),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
-    blur_hint = f"BLUR -> o / p (ksize={BLUR_KERNEL_OPTIONS[BLUR_KERNEL_IDX]})"
+    blur_hint = f"BLUR -> o / p (ksize={BLUR_KERNEL_OPTIONS[BLUR_KERNEL_IDX]}) | b: {'ON' if BLUR_ENABLED else 'OFF'}"
     cv2.putText(canvas, blur_hint, (10, footer_y5),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+    thresh_hint = f"THRESH -> j/k (val={MASK_THRESH})"
+    cv2.putText(canvas, thresh_hint, (10, footer_y6),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
 
 
@@ -325,7 +331,7 @@ class NDIPublisher:
 def main():
     # Carga modelo YOLOv8 de segmentación (usa uno ligero por defecto).
     model_path = "yolov8n-seg.pt"
-    global DEVICE, CURRENT_MODEL_PATH, CURRENT_MODEL_KEY, CURRENT_PEOPLE_LIMIT, CURRENT_SOURCE, BLUR_KERNEL_IDX
+    global DEVICE, CURRENT_MODEL_PATH, CURRENT_MODEL_KEY, CURRENT_PEOPLE_LIMIT, CURRENT_SOURCE, BLUR_KERNEL_IDX, MASK_THRESH, BLUR_ENABLED
     load_saved_resolution()
     load_saved_model()
     if torch.backends.mps.is_available():
@@ -370,7 +376,7 @@ def main():
 
         do_process = frame_idx % PROCESS_EVERY_N == 0 or last_mask is None
         if do_process:
-            mask, boxes = segment_people(frame, model, CURRENT_PEOPLE_LIMIT)
+            mask, boxes = segment_people(frame, model, CURRENT_PEOPLE_LIMIT, MASK_THRESH, BLUR_ENABLED)
             last_mask, last_boxes = mask, boxes
         else:
             mask, boxes = last_mask, last_boxes
@@ -436,6 +442,13 @@ def main():
             BLUR_KERNEL_IDX = max(0, BLUR_KERNEL_IDX - 1)
         if key == ord("p"):
             BLUR_KERNEL_IDX = min(len(BLUR_KERNEL_OPTIONS) - 1, BLUR_KERNEL_IDX + 1)
+        if key == ord("b"):
+            BLUR_ENABLED = not BLUR_ENABLED
+        # Ajuste de threshold de binarización
+        if key == ord("j"):
+            MASK_THRESH = max(0, MASK_THRESH - 5)
+        if key == ord("k"):
+            MASK_THRESH = min(255, MASK_THRESH + 5)
         # Cambio de fuente
         if key == ord("c"):
             CURRENT_SOURCE = "camera"
