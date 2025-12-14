@@ -168,12 +168,20 @@ def make_composite(frame: np.ndarray, mask: np.ndarray) -> np.ndarray:
 
 
 def fit_to_box(image: np.ndarray, box_size: Tuple[int, int]) -> np.ndarray:
-    """Resize image to fit inside box_size keeping aspect ratio; letterbox on black (top-aligned)."""
+    """Resize image to fit inside box_size keeping aspect ratio; no extra padding if width matches."""
     box_w, box_h = box_size
     h, w = image.shape[:2]
     scale = min(box_w / w, box_h / h)
     new_size = (max(1, int(w * scale)), max(1, int(h * scale)))
     resized = cv2.resize(image, new_size, interpolation=cv2.INTER_AREA)
+
+    if new_size[0] == box_w:
+        # Height is already within box_h; crop if needed to avoid left padding.
+        if new_size[1] > box_h:
+            resized = resized[0:box_h, 0:box_w]
+        canvas = np.zeros((box_h, box_w, 3), dtype=np.uint8)
+        canvas[0 : resized.shape[0], 0 : resized.shape[1]] = resized
+        return canvas
 
     canvas = np.zeros((box_h, box_w, 3), dtype=np.uint8)
     y_off = 0  # align to top
@@ -216,19 +224,20 @@ def add_footer(canvas: np.ndarray, current_res: int) -> None:
     footer_y1 = canvas.shape[0] - 240
     footer_y2 = canvas.shape[0] - 210
     footer_y3 = canvas.shape[0] - 180
-    footer_y4 = canvas.shape[0] - 140
-    footer_y5 = canvas.shape[0] - 110
-    footer_y6 = canvas.shape[0] - 80
-    footer_y7 = canvas.shape[0] - 50
+    footer_y4 = canvas.shape[0] - 150
+    footer_y5 = canvas.shape[0] - 120
+    footer_y6 = canvas.shape[0] - 90
+    footer_y7 = canvas.shape[0] - 60
+    footer_y8 = canvas.shape[0] - 30
     res_opts = " | ".join(f"{i+1}:{r}" for i, r in enumerate(RES_OPTIONS))
     model_opts = " | ".join(f"{chr(k)}:{v[0]}" for k, v in MODEL_OPTIONS.items())
     cv2.putText(canvas, f"RES -> {res_opts} ", (10, footer_y1),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
     current_model_label = MODEL_OPTIONS.get(CURRENT_MODEL_KEY, ("", ""))[1]
     cv2.putText(canvas, f"MODEL -> {model_opts} ", (10, footer_y2),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
     cv2.putText(canvas, f"PEOPLE -> +/- (limit={CURRENT_PEOPLE_LIMIT})", (10, footer_y3),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
     src_opts = ["c:camara"]
     if VIDEO_FILES:
         src_opts.append("v:video")
@@ -236,19 +245,19 @@ def add_footer(canvas: np.ndarray, current_res: int) -> None:
         src_opts.append("n:ndi")
     source_hint = "SRC -> " + " | ".join(src_opts)
     cv2.putText(canvas, source_hint, (10, footer_y4),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
     blur_hint = f"BLUR -> o / p (ksize={BLUR_KERNEL_OPTIONS[BLUR_KERNEL_IDX]}) | b: {'ON' if BLUR_ENABLED else 'OFF'}"
     cv2.putText(canvas, blur_hint, (10, footer_y5),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
     thresh_hint = f"THRESH -> j/k (val={MASK_THRESH})"
     cv2.putText(canvas, thresh_hint, (10, footer_y6),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
     imgsz_hint = f"IMG_SZ -> , / . (imgsz={IMG_SIZE_OPTIONS[IMG_SIZE_IDX]})"
     cv2.putText(canvas, imgsz_hint, (10, footer_y7),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
     hi_hint = f"HIGH PREC -> h ({'ON' if HIGH_PRECISION_MODE else 'OFF'}) | MASK VIEW -> m (soft/detail)"
-    cv2.putText(canvas, hi_hint, (10, footer_y7 + 20),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+    cv2.putText(canvas, hi_hint, (10, footer_y8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
 
 
 def set_resolution_by_index(idx: int):
@@ -580,18 +589,16 @@ def main():
     load_saved_model()
     env_device = os.environ.get("NEXT_DEVICE", "").strip().lower()
     if env_device and env_device != "auto":
-        # Permite forzar cpu/mps/cuda para esquivar crashes nativos.
+        # Permite forzar cpu/mps/cuda manualmente.
         DEVICE = env_device
-    elif env_device == "auto":
+    else:
+        # Auto: intenta mps -> cuda -> cpu.
         if torch.backends.mps.is_available():
             DEVICE = "mps"
         elif torch.cuda.is_available():
             DEVICE = "cuda"
         else:
             DEVICE = "cpu"
-    else:
-        # Por defecto CPU para evitar segfaults en algunos backends (mps/AVFoundation).
-        DEVICE = "cpu"
 
     env_source = os.environ.get("NEXT_SOURCE", "").strip().lower()
     # Probar NDI en proceso aislado para evitar segfault en main.
