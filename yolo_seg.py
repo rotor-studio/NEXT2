@@ -34,8 +34,7 @@ CURRENT_MODEL_KEY = ord("a")
 CURRENT_MODEL_PATH = MODEL_OPTIONS[CURRENT_MODEL_KEY][0]
 PEOPLE_LIMIT_OPTIONS = list(range(1, 21))
 CURRENT_PEOPLE_LIMIT = 10
-ENABLE_SYPHON = True  # Envía la máscara por Syphon si la librería está disponible
-ENABLE_NDI = True     # Envía la máscara por NDI si la librería está disponible
+ENABLE_NDI = True     # Envía la máscara por NDI
 
 # --------------- utils de captura y redimensionado -----------------
 def resize_keep_aspect(frame, max_height: int = 480):
@@ -221,25 +220,9 @@ class SyphonPublisher:
     def __init__(self, name: str):
         self.server = None
         self.name = name
-        if not ENABLE_SYPHON:
-            return
-        try:
-            from pysyphon import Server  # type: ignore
-            self.server = Server(name)
-        except Exception as exc:
-            print(f"[Syphon] No disponible: {exc}", file=sys.stderr)
-            self.server = None
 
     def publish(self, frame: np.ndarray):
-        if self.server is None:
-            return
-        try:
-            # pysyphon espera BGR/RGB uint8; enviamos la máscara como gris expandido.
-            if frame.ndim == 2:
-                frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-            self.server.publish(frame)
-        except Exception as exc:
-            print(f"[Syphon] Error al publicar: {exc}", file=sys.stderr)
+        return
 
 
 class NDIPublisher:
@@ -329,7 +312,6 @@ def main():
     frame_idx = 0
     last_mask = None
     last_boxes = None
-    syphon_pub = SyphonPublisher("NEXT2 Mask") if ENABLE_SYPHON else None
     ndi_pub = NDIPublisher("NEXT2 Mask NDI") if ENABLE_NDI else None
 
     while True:
@@ -374,9 +356,7 @@ def main():
         add_header(canvas, fps, DEVICE, res_text, people_count)
         add_footer(canvas, CURRENT_MAX_HEIGHT)
 
-        # Publicación Syphon (máscara)
-        if syphon_pub is not None:
-            syphon_pub.publish(mask)
+        # Publicación NDI (máscara)
         if ndi_pub is not None:
             ndi_pub.publish(mask)
 
