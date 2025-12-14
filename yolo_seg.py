@@ -18,7 +18,8 @@ from ultralytics import YOLO
 # Configuración de rendimiento
 RES_OPTIONS = [160, 240, 320, 360, 480]  # opciones de altura máxima
 CURRENT_MAX_HEIGHT = 240  # valor inicial (se sobreescribe si hay guardado)
-IMG_SIZE = 320    # resolución de inferencia YOLO
+IMG_SIZE_OPTIONS = [320, 480, 640]  # resoluciones de inferencia YOLO
+IMG_SIZE_IDX = 0  # índice inicial -> 320
 PROCESS_EVERY_N = 2  # procesa 1 de cada N frames (2 = mitad)
 CAP_WIDTH = 640   # resolución solicitada a la cámara (puede ajustarse)
 CAP_HEIGHT = 480
@@ -74,7 +75,8 @@ def segment_people(frame: np.ndarray, model: YOLO, people_limit: int, mask_thres
     - Returns all-black mask if no persons are found.
     """
     h, w = frame.shape[:2]
-    result = model(frame, imgsz=IMG_SIZE, verbose=False, device=DEVICE)[0]
+    imgsz = IMG_SIZE_OPTIONS[IMG_SIZE_IDX]
+    result = model(frame, imgsz=imgsz, verbose=False, device=DEVICE)[0]
 
     # If the model returns no masks, bail early.
     if result.masks is None or result.boxes is None:
@@ -168,6 +170,7 @@ def add_footer(canvas: np.ndarray, current_res: int) -> None:
     footer_y4 = canvas.shape[0] - 100
     footer_y5 = canvas.shape[0] - 70
     footer_y6 = canvas.shape[0] - 40
+    footer_y7 = canvas.shape[0] - 10
     res_opts = " | ".join(f"{i+1}:{r}" for i, r in enumerate(RES_OPTIONS))
     model_opts = " | ".join(f"{chr(k)}:{v[0]}" for k, v in MODEL_OPTIONS.items())
     cv2.putText(canvas, f"RES -> {res_opts} ", (10, footer_y1),
@@ -185,6 +188,9 @@ def add_footer(canvas: np.ndarray, current_res: int) -> None:
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
     thresh_hint = f"THRESH -> j/k (val={MASK_THRESH})"
     cv2.putText(canvas, thresh_hint, (10, footer_y6),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+    imgsz_hint = f"IMG_SZ -> , / . (imgsz={IMG_SIZE_OPTIONS[IMG_SIZE_IDX]})"
+    cv2.putText(canvas, imgsz_hint, (10, footer_y7),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
 
 
@@ -331,7 +337,7 @@ class NDIPublisher:
 def main():
     # Carga modelo YOLOv8 de segmentación (usa uno ligero por defecto).
     model_path = "yolov8n-seg.pt"
-    global DEVICE, CURRENT_MODEL_PATH, CURRENT_MODEL_KEY, CURRENT_PEOPLE_LIMIT, CURRENT_SOURCE, BLUR_KERNEL_IDX, MASK_THRESH, BLUR_ENABLED
+    global DEVICE, CURRENT_MODEL_PATH, CURRENT_MODEL_KEY, CURRENT_PEOPLE_LIMIT, CURRENT_SOURCE, BLUR_KERNEL_IDX, MASK_THRESH, BLUR_ENABLED, IMG_SIZE_IDX
     load_saved_resolution()
     load_saved_model()
     if torch.backends.mps.is_available():
@@ -356,7 +362,7 @@ def main():
     window_name = "NEXT2 VISION - ROTOR STUDIO"
     canvas_size = (1280, 720)  # width, height
     header_h = 40
-    footer_h = 180
+    footer_h = 230
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL | cv2.WINDOW_GUI_NORMAL)
     cv2.resizeWindow(window_name, canvas_size[0], canvas_size[1])
     frame_idx = 0
@@ -449,6 +455,11 @@ def main():
             MASK_THRESH = max(0, MASK_THRESH - 5)
         if key == ord("k"):
             MASK_THRESH = min(255, MASK_THRESH + 5)
+        # Ajuste de imgsz (resolución de inferencia)
+        if key == ord(","):
+            IMG_SIZE_IDX = max(0, IMG_SIZE_IDX - 1)
+        if key == ord("."):
+            IMG_SIZE_IDX = min(len(IMG_SIZE_OPTIONS) - 1, IMG_SIZE_IDX + 1)
         # Cambio de fuente
         if key == ord("c"):
             CURRENT_SOURCE = "camera"
