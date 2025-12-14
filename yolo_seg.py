@@ -65,7 +65,11 @@ def capture_frame(cap: cv2.VideoCapture):
         frame = cap.capture()
         if frame is None:
             return None
-        return resize_keep_aspect(frame, max_height=CURRENT_MAX_HEIGHT)
+        # Para NDI, limitamos a la resolución de entrada seleccionada (altura) y al imgsz actual.
+        target_h = min(CURRENT_MAX_HEIGHT, IMG_SIZE_OPTIONS[IMG_SIZE_IDX])
+        if HIGH_PRECISION_MODE:
+            target_h = max(target_h, IMG_SIZE_OPTIONS[-1])
+        return resize_keep_aspect(frame, max_height=target_h)
     ok, frame = cap.read()
     if not ok:
         return None
@@ -520,7 +524,9 @@ def main():
                 if last_frame is not None:
                     frame = last_frame.copy()
                 else:
-                    frame = np.zeros((CURRENT_MAX_HEIGHT, int(CURRENT_MAX_HEIGHT * 16 / 9), 3), dtype=np.uint8)
+                    fallback_h = min(CURRENT_MAX_HEIGHT, IMG_SIZE_OPTIONS[IMG_SIZE_IDX])
+                    fallback_w = int(fallback_h * 16 / 9)
+                    frame = np.zeros((fallback_h, fallback_w, 3), dtype=np.uint8)
                 got_new_frame = False
             if frame is None:
                 print("Frame no capturado. Saliendo.", file=sys.stderr)
