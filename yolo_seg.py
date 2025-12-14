@@ -35,6 +35,7 @@ CURRENT_MODEL_PATH = MODEL_OPTIONS[CURRENT_MODEL_KEY][0]
 PEOPLE_LIMIT_OPTIONS = list(range(1, 21))
 CURRENT_PEOPLE_LIMIT = 10
 ENABLE_SYPHON = True  # Envía la máscara por Syphon si la librería está disponible
+ENABLE_NDI = True     # Envía la máscara por NDI si la librería está disponible
 
 # --------------- utils de captura y redimensionado -----------------
 def resize_keep_aspect(frame, max_height: int = 480):
@@ -241,6 +242,56 @@ class SyphonPublisher:
             print(f"[Syphon] Error al publicar: {exc}", file=sys.stderr)
 
 
+class NDIPublisher:
+    """Wrapper para publicar frames por NDI si la librería está disponible."""
+
+    def __init__(self, name: str):
+        self.name = name
+        self.ndi = None
+        self.sender = None
+        if not ENABLE_NDI:
+            return
+        try:
+            import NDIlib as ndi  # type: ignore
+
+            if not ndi.initialize():
+                print("[NDI] No se pudo inicializar NDIlib.", file=sys.stderr)
+                return
+            send_settings = ndi.SendCreate()
+            send_settings.ndi_name = name
+            self.sender = ndi.send_create(send_settings)
+            self.ndi = ndi
+        except Exception as exc:
+            print(f"[NDI] No disponible: {exc}", file=sys.stderr)
+            self.sender = None
+            self.ndi = None
+
+    def publish(self, frame: np.ndarray):
+        if self.sender is None or self.ndi is None:
+            return
+        try:
+            ndi = self.ndi
+            # Convertimos a BGRA para NDI.
+            if frame.ndim == 2:
+                frame_bgra = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGRA)
+            else:
+                frame_bgra = cv2.cvtColor(frame, cv2.COLOR_BGR2BGRA)
+
+            h, w = frame_bgra.shape[:2]
+            video_frame = ndi.VideoFrameV2()
+            video_frame.xres = w
+            video_frame.yres = h
+            video_frame.FourCC = ndi.FOURCC_VIDEO_TYPE_BGRA
+            video_frame.frame_rate_N = 60
+            video_frame.frame_rate_D = 1
+            video_frame.line_stride_in_bytes = frame_bgra.strides[0]
+            video_frame.data = frame_bgra
+
+            ndi.send_send_video_v2(self.sender, video_frame)
+        except Exception as exc:
+            print(f"[NDI] Error al publicar: {exc}", file=sys.stderr)
+
+
 # --------------- loop principal ------------------------------------
 def main():
     # Carga modelo YOLOv8 de segmentación (usa uno ligero por defecto).
@@ -279,6 +330,7 @@ def main():
     last_mask = None
     last_boxes = None
     syphon_pub = SyphonPublisher("NEXT2 Mask") if ENABLE_SYPHON else None
+    ndi_pub = NDIPublisher("NEXT2 Mask NDI") if ENABLE_NDI else None
 
     while True:
         frame = capture_frame(cap)
@@ -325,6 +377,8 @@ def main():
         # Publicación Syphon (máscara)
         if syphon_pub is not None:
             syphon_pub.publish(mask)
+        if ndi_pub is not None:
+            ndi_pub.publish(mask)
 
         cv2.imshow(window_name, canvas)
 
