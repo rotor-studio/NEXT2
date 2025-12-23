@@ -1,11 +1,12 @@
 {
-  "people_limit": 10,
+  "people_limit": 14,
   "blur_kernel_idx": 0,
   "blur_enabled": true,
-  "mask_thresh": 127,
+  "mask_thresh": 72,
   "img_size_idx": 2,
   "high_precision_mode": true,
   "ndi_output_mask": "soft",
   "source": "camera",
-  "show_detail": false
+  "show_detail": false,
+  "flip_input": true
 }

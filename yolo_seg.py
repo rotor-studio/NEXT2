@@ -62,6 +62,7 @@ HIGH_PRECISION_MODE = False  # modo alta precisión (imgsz alto y sin blur en ma
 NDI_OUTPUT_MASK = "soft"  # "soft" o "detail"
 SHOW_DETAIL_DEFAULT = False
 SHOW_DETAIL = SHOW_DETAIL_DEFAULT
+FLIP_INPUT = False
 
 # --------------- utils de captura y redimensionado -----------------
 def resize_keep_aspect(frame, max_height: int = 480):
@@ -74,6 +75,12 @@ def resize_keep_aspect(frame, max_height: int = 480):
     return cv2.resize(frame, new_size, interpolation=cv2.INTER_AREA)
 
 
+def maybe_flip_input(frame: np.ndarray) -> np.ndarray:
+    if not FLIP_INPUT:
+        return frame
+    return cv2.flip(frame, 1)
+
+
 def capture_frame(cap: cv2.VideoCapture):
     """Capture and resize a frame; returns None if capture fails."""
     if isinstance(cap, NDIReceiver):
@@ -84,11 +91,13 @@ def capture_frame(cap: cv2.VideoCapture):
         target_h = min(CURRENT_MAX_HEIGHT, IMG_SIZE_OPTIONS[IMG_SIZE_IDX])
         if HIGH_PRECISION_MODE:
             target_h = max(target_h, IMG_SIZE_OPTIONS[-1])
-        return resize_keep_aspect(frame, max_height=target_h)
+        frame = resize_keep_aspect(frame, max_height=target_h)
+        return maybe_flip_input(frame)
     ok, frame = cap.read()
     if not ok:
         return None
-    return resize_keep_aspect(frame, max_height=CURRENT_MAX_HEIGHT)
+    frame = resize_keep_aspect(frame, max_height=CURRENT_MAX_HEIGHT)
+    return maybe_flip_input(frame)
 
 
 # --------------- segmentación --------------------------------------
@@ -257,7 +266,10 @@ def add_footer(canvas: np.ndarray, current_res: int) -> None:
     imgsz_hint = f"IMG_SZ -> , / . (imgsz={IMG_SIZE_OPTIONS[IMG_SIZE_IDX]})"
     cv2.putText(canvas, imgsz_hint, (10, footer_y7),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
-    hi_hint = f"HIGH PREC -> h ({'ON' if HIGH_PRECISION_MODE else 'OFF'}) | MASK VIEW -> m (soft/detail)"
+    hi_hint = (
+        f"HIGH PREC -> h ({'ON' if HIGH_PRECISION_MODE else 'OFF'}) | MASK VIEW -> m (soft/detail)"
+        f" | FLIP IN -> f ({'ON' if FLIP_INPUT else 'OFF'})"
+    )
     cv2.putText(canvas, hi_hint, (10, footer_y8),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
 
@@ -391,7 +403,8 @@ def _ndi_probe_worker(result_queue: mp.Queue):
         finder = ndi.Finder()
         finder.open()
         finder.wait_for_sources(0.5)
-        result_queue.put(finder.num_sources > 0)
+        # NDI salida no depende de fuentes detectadas; basta con inicializar runtime.
+        result_queue.put(True)
         finder.close()
     except Exception:
         result_queue.put(False)
@@ -421,7 +434,7 @@ def _clamp(val: int, low: int, high: int) -> int:
 
 def load_settings():
     global CURRENT_PEOPLE_LIMIT, BLUR_KERNEL_IDX, BLUR_ENABLED, MASK_THRESH
-    global IMG_SIZE_IDX, HIGH_PRECISION_MODE, NDI_OUTPUT_MASK, CURRENT_SOURCE, SHOW_DETAIL
+    global IMG_SIZE_IDX, HIGH_PRECISION_MODE, NDI_OUTPUT_MASK, CURRENT_SOURCE, SHOW_DETAIL, FLIP_INPUT
     try:
         import json
 
@@ -467,6 +480,10 @@ def load_settings():
         SHOW_DETAIL = bool(data.get("show_detail", SHOW_DETAIL_DEFAULT))
     except Exception:
         pass
+    try:
+        FLIP_INPUT = bool(data.get("flip_input", FLIP_INPUT))
+    except Exception:
+        pass
 
 
 def save_settings(extra: dict[str, Any] | None = None):
@@ -480,6 +497,7 @@ def save_settings(extra: dict[str, Any] | None = None):
         "ndi_output_mask": NDI_OUTPUT_MASK,
         "source": CURRENT_SOURCE,
         "show_detail": SHOW_DETAIL,
+        "flip_input": FLIP_INPUT,
     }
     if extra:
         base.update(extra)
@@ -666,7 +684,7 @@ def main():
     # Carga modelo YOLOv8 de segmentación (usa uno ligero por defecto).
     model_path = "yolov8n-seg.pt"
     global DEVICE, CURRENT_MODEL_PATH, CURRENT_MODEL_KEY, CURRENT_PEOPLE_LIMIT, CURRENT_SOURCE
-    global BLUR_KERNEL_IDX, MASK_THRESH, BLUR_ENABLED, IMG_SIZE_IDX, HIGH_PRECISION_MODE, ENABLE_NDI, DEFAULT_SOURCE, SHOW_DETAIL
+    global BLUR_KERNEL_IDX, MASK_THRESH, BLUR_ENABLED, IMG_SIZE_IDX, HIGH_PRECISION_MODE, ENABLE_NDI, DEFAULT_SOURCE, SHOW_DETAIL, FLIP_INPUT
     load_saved_resolution()
     load_saved_model()
     load_settings()
@@ -884,6 +902,10 @@ def main():
         if key == ord("m"):
             show_detail = not show_detail
             SHOW_DETAIL = show_detail
+            save_settings()
+        # Flip horizontal de la entrada
+        if key == ord("f"):
+            FLIP_INPUT = not FLIP_INPUT
             save_settings()
 
     cap.release()

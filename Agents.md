@@ -16,6 +16,7 @@ Controls
 - Mask view: `m` toggles between soft/detail
 - Precision: `h` toggles high precision (uses max imgsz)
 - img size for YOLO: `,` / `.` cycle imgsz (320/480/640)
+- Flip input: `f` toggles horizontal flip on/off
 
 Persistence
 - Resolution persists in `resolution.txt`
