@@ -9,6 +9,7 @@ from __future__ import annotations
 import sys
 import time
 import math
+import threading
 from typing import Tuple, Any, Optional
 import os
 import multiprocessing as mp
@@ -77,6 +78,10 @@ VIEW_BG_COLOR = (0, 0, 0)
 RIGHT_PANEL_FOOTER_H = 70  # espacio bajo la tercera ventana para botones
 RIGHT_PANEL_MARGIN_X = 20
 RIGHT_PANEL_ROW_GAP = 10
+FIT_CACHE = {}
+FIT_CACHE_ORDER = []
+FIT_CACHE_MAX = 6
+USE_INFERENCE_THREAD = True
 VIEW_HITBOXES = []
 ACTIVE_VIEW_TAB = "mask"
 ROI_LIST = []
@@ -240,6 +245,10 @@ def fit_to_box(image: np.ndarray, box_size: Tuple[int, int]) -> np.ndarray:
     """Resize image to fit inside box_size keeping aspect ratio; no extra padding if width matches."""
     box_w, box_h = box_size
     h, w = image.shape[:2]
+    cache_key = (id(image), box_w, box_h, w, h)
+    cached = FIT_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     scale = min(box_w / w, box_h / h)
     new_size = (max(1, int(w * scale)), max(1, int(h * scale)))
     resized = cv2.resize(image, new_size, interpolation=cv2.INTER_AREA)
@@ -250,12 +259,22 @@ def fit_to_box(image: np.ndarray, box_size: Tuple[int, int]) -> np.ndarray:
             resized = resized[0:box_h, 0:box_w]
         canvas = np.zeros((box_h, box_w, 3), dtype=np.uint8)
         canvas[0 : resized.shape[0], 0 : resized.shape[1]] = resized
+        FIT_CACHE[cache_key] = canvas
+        FIT_CACHE_ORDER.append(cache_key)
+        if len(FIT_CACHE_ORDER) > FIT_CACHE_MAX:
+            old_key = FIT_CACHE_ORDER.pop(0)
+            FIT_CACHE.pop(old_key, None)
         return canvas
 
     canvas = np.zeros((box_h, box_w, 3), dtype=np.uint8)
     y_off = 0  # align to top
     x_off = (box_w - new_size[0]) // 2
     canvas[y_off : y_off + new_size[1], x_off : x_off + new_size[0]] = resized
+    FIT_CACHE[cache_key] = canvas
+    FIT_CACHE_ORDER.append(cache_key)
+    if len(FIT_CACHE_ORDER) > FIT_CACHE_MAX:
+        old_key = FIT_CACHE_ORDER.pop(0)
+        FIT_CACHE.pop(old_key, None)
     return canvas
 
 
@@ -1039,20 +1058,21 @@ def release_capture(cap):
             pass
 
 
-def apply_model_change(model: YOLO, new_key: int) -> YOLO:
+def apply_model_change(model: YOLO, new_key: int, load: bool = True) -> YOLO:
     """Swap YOLO model if key differs; keeps current on failure."""
     global CURRENT_MODEL_KEY, CURRENT_MODEL_PATH
     if new_key not in MODEL_OPTIONS or new_key == CURRENT_MODEL_KEY:
         return model
+    CURRENT_MODEL_KEY = new_key
+    CURRENT_MODEL_PATH = MODEL_OPTIONS[new_key][0]
+    save_current_model()
+    save_settings()
+    if not load:
+        return model
     try:
-        new_model = load_model(MODEL_OPTIONS[new_key][0])
-        CURRENT_MODEL_KEY = new_key
-        CURRENT_MODEL_PATH = MODEL_OPTIONS[new_key][0]
-        save_current_model()
-        save_settings()
-        return new_model
+        return load_model(CURRENT_MODEL_PATH)
     except Exception as exc:
-        print(f"No se pudo cargar el modelo {MODEL_OPTIONS[new_key][0]}: {exc}", file=sys.stderr)
+        print(f"No se pudo cargar el modelo {CURRENT_MODEL_PATH}: {exc}", file=sys.stderr)
         return model
 
 
@@ -1231,6 +1251,73 @@ def save_settings(extra: dict[str, Any] | None = None):
         SETTINGS_FILE.write_text(json.dumps(base, indent=2), encoding="utf-8")
     except Exception:
         pass
+
+
+class InferenceWorker:
+    def __init__(self, model_path: str):
+        self.model_path = model_path
+        self.model = load_model(model_path)
+        self.frame_lock = threading.Lock()
+        self.result_lock = threading.Lock()
+        self.event = threading.Event()
+        self.stop_event = threading.Event()
+        self.pending = None
+        self.result = None
+        self.result_seq = 0
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+
+    def update_frame(self, frame: np.ndarray, settings: dict[str, Any]) -> None:
+        with self.frame_lock:
+            self.pending = (frame, settings)
+        self.event.set()
+
+    def set_model_path(self, model_path: str) -> None:
+        with self.frame_lock:
+            self.model_path = model_path
+        self.event.set()
+
+    def get_latest(self) -> Tuple[Any, int]:
+        with self.result_lock:
+            return self.result, self.result_seq
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self.event.set()
+        self.thread.join(timeout=1.0)
+
+    def _maybe_reload(self, path: str) -> None:
+        if path == self.model_path:
+            return
+        self.model_path = path
+        self.model = load_model(path)
+
+    def _loop(self) -> None:
+        while not self.stop_event.is_set():
+            self.event.wait(0.01)
+            if self.stop_event.is_set():
+                break
+            with self.frame_lock:
+                req = self.pending
+                self.pending = None
+                current_model_path = self.model_path
+            self.event.clear()
+            if req is None:
+                continue
+            frame, settings = req
+            if current_model_path != self.model_path:
+                self._maybe_reload(current_model_path)
+            masks = segment_people(
+                frame,
+                self.model,
+                settings["people_limit"],
+                settings["mask_thresh"],
+                settings["blur_enabled"],
+                compute_person_masks=settings["compute_person_masks"],
+            )
+            with self.result_lock:
+                self.result = masks
+                self.result_seq += 1
 
 
 # --------------- Syphon (opcional) ----------------------------------
@@ -1450,11 +1537,19 @@ def main():
         print("[NDI] Fuente NDI solicitada pero NDI no está disponible, usando cámara.", file=sys.stderr)
         CURRENT_SOURCE = "camera"
 
-    try:
-        model = load_model(CURRENT_MODEL_PATH)
-    except Exception as exc:
-        print(f"No se pudo cargar el modelo {CURRENT_MODEL_PATH}: {exc}", file=sys.stderr)
-        return 1
+    infer_worker = None
+    if USE_INFERENCE_THREAD:
+        try:
+            infer_worker = InferenceWorker(CURRENT_MODEL_PATH)
+        except Exception as exc:
+            print(f"No se pudo cargar el modelo {CURRENT_MODEL_PATH}: {exc}", file=sys.stderr)
+            return 1
+    else:
+        try:
+            model = load_model(CURRENT_MODEL_PATH)
+        except Exception as exc:
+            print(f"No se pudo cargar el modelo {CURRENT_MODEL_PATH}: {exc}", file=sys.stderr)
+            return 1
 
     cap = open_capture(CURRENT_SOURCE)
     if not capture_ready(cap):
@@ -1475,9 +1570,16 @@ def main():
     last_boxed = None
     last_person_masks = []
     last_frame = None
+    last_mask_to_show = None
     cached_middle_view = None
     cached_middle_key = None
     cached_translated = None
+    cached_left_view = None
+    cached_left_key = None
+    cached_left_labeled = None
+    cached_left_labeled_key = None
+    cached_right_bgr = None
+    cached_right_key = None
     persist_mask = None
     last_detect_time = None
     last_detect_mask = None
@@ -1487,9 +1589,12 @@ def main():
         NDIPublisher("NEXT2 Translations NDI") if ENABLE_NDI and ENABLE_NDI_TRANSLATIONS_OUTPUT else None
     )
 
+    last_result_seq = 0
     while True:
         if UI_PENDING_MODEL_KEY is not None:
-            model = apply_model_change(model, UI_PENDING_MODEL_KEY)
+            model = apply_model_change(model, UI_PENDING_MODEL_KEY, load=not USE_INFERENCE_THREAD)
+            if infer_worker is not None:
+                infer_worker.set_model_path(CURRENT_MODEL_PATH)
             UI_PENDING_MODEL_KEY = None
         if UI_PENDING_SOURCE is not None:
             cap = apply_source_change(UI_PENDING_SOURCE, cap)
@@ -1519,17 +1624,48 @@ def main():
         do_process = (frame_idx % PROCESS_EVERY_N == 0 or last_mask_soft is None) and got_new_frame
         if do_process:
             need_person_masks = len(ROI_LIST) > 0
-            mask_soft, mask_detail, boxes, person_masks = segment_people(
-                frame, model, CURRENT_PEOPLE_LIMIT, MASK_THRESH, BLUR_ENABLED, compute_person_masks=need_person_masks
-            )
-            last_mask_soft, last_mask_detail, last_boxes, last_person_masks = (
-                mask_soft,
-                mask_detail,
-                boxes,
-                person_masks,
-            )
-            last_frame = frame
-        else:
+            if infer_worker is not None:
+                infer_worker.update_frame(
+                    frame,
+                    {
+                        "people_limit": CURRENT_PEOPLE_LIMIT,
+                        "mask_thresh": MASK_THRESH,
+                        "blur_enabled": BLUR_ENABLED,
+                        "compute_person_masks": need_person_masks,
+                    },
+                )
+            else:
+                mask_soft, mask_detail, boxes, person_masks = segment_people(
+                    frame, model, CURRENT_PEOPLE_LIMIT, MASK_THRESH, BLUR_ENABLED, compute_person_masks=need_person_masks
+                )
+                last_mask_soft, last_mask_detail, last_boxes, last_person_masks = (
+                    mask_soft,
+                    mask_detail,
+                    boxes,
+                    person_masks,
+                )
+                last_frame = frame
+
+        if infer_worker is not None:
+            result, seq = infer_worker.get_latest()
+            if result is not None and seq != last_result_seq:
+                last_result_seq = seq
+                mask_soft, mask_detail, boxes, person_masks = result
+                last_mask_soft, last_mask_detail, last_boxes, last_person_masks = (
+                    mask_soft,
+                    mask_detail,
+                    boxes,
+                    person_masks,
+                )
+                last_frame = frame
+            else:
+                mask_soft, mask_detail, boxes, person_masks = (
+                    last_mask_soft,
+                    last_mask_detail,
+                    last_boxes,
+                    last_person_masks,
+                )
+        elif not do_process:
             mask_soft, mask_detail, boxes, person_masks = (
                 last_mask_soft,
                 last_mask_detail,
@@ -1572,8 +1708,18 @@ def main():
         view_y = header_h + VIEW_OFFSET_Y
         VIEW_HITBOXES = []
 
-        left_view = fit_to_box(boxed, (third_w, view_h))
-        mask_to_show = mask_detail if show_detail else mask_soft
+        left_key = (id(boxed), third_w, view_h)
+        if cached_left_view is None or cached_left_key != left_key:
+            left_view = fit_to_box(boxed, (third_w, view_h))
+            cached_left_view = left_view
+            cached_left_key = left_key
+        else:
+            left_view = cached_left_view
+        if do_process or last_mask_to_show is None:
+            mask_to_show = mask_detail if show_detail else mask_soft
+            last_mask_to_show = mask_to_show
+        else:
+            mask_to_show = last_mask_to_show
         if ACTIVE_VIEW_TAB == "mask":
             middle_key = (show_detail, id(mask_soft), id(mask_detail), ACTIVE_VIEW_TAB)
             if cached_middle_view is None or cached_middle_key != middle_key:
@@ -1604,9 +1750,21 @@ def main():
             ROI_DIRTY = False
         else:
             translated = cached_translated
-        right_image = cv2.cvtColor(translated, cv2.COLOR_GRAY2BGR)
+        right_key = (id(translated), third_w, right_view_h)
+        if cached_right_bgr is None or cached_right_key != right_key:
+            right_image = cv2.cvtColor(translated, cv2.COLOR_GRAY2BGR)
+            cached_right_bgr = right_image
+            cached_right_key = right_key
+        else:
+            right_image = cached_right_bgr
 
-        left_view = make_labeled_view(left_view, "Original + Boxes", (third_w, view_h))
+        left_labeled_key = (id(left_view), third_w, view_h)
+        if cached_left_labeled is None or cached_left_labeled_key != left_labeled_key:
+            left_view = make_labeled_view(left_view, "Original + Boxes", (third_w, view_h))
+            cached_left_labeled = left_view
+            cached_left_labeled_key = left_labeled_key
+        else:
+            left_view = cached_left_labeled
         middle_view, tab_rects = make_tabbed_view(
             middle_image,
             (third_w, view_h),
@@ -1623,21 +1781,22 @@ def main():
             roi_h,
         )
         rx0, ry0, rw, rh = ROI_PANEL_BOUNDS_ABS
-        for roi in ROI_LIST:
-            _clamp_roi(roi, rw, rh)
-            x1, y1, x2, y2 = _roi_rect(roi)
-            x1 = max(0, min(rw - 1, x1))
-            y1 = max(0, min(rh - 1, y1))
-            x2 = max(0, min(rw - 1, x2))
-            y2 = max(0, min(rh - 1, y2))
-            if x2 > x1 and y2 > y1:
-                cv2.rectangle(
-                    right_view,
-                    (x1, VIEW_LABEL_H + y1),
-                    (x2, VIEW_LABEL_H + y2),
-                    (255, 0, 0),
-                    2,
-                )
+        if ROI_LIST:
+            for roi in ROI_LIST:
+                _clamp_roi(roi, rw, rh)
+                x1, y1, x2, y2 = _roi_rect(roi)
+                x1 = max(0, min(rw - 1, x1))
+                y1 = max(0, min(rh - 1, y1))
+                x2 = max(0, min(rw - 1, x2))
+                y2 = max(0, min(rh - 1, y2))
+                if x2 > x1 and y2 > y1:
+                    cv2.rectangle(
+                        right_view,
+                        (x1, VIEW_LABEL_H + y1),
+                        (x2, VIEW_LABEL_H + y2),
+                        (255, 0, 0),
+                        2,
+                    )
 
         canvas[view_y : view_y + left_view.shape[0], 0:third_w] = left_view
         canvas[
@@ -1826,6 +1985,8 @@ def main():
             FLIP_INPUT = not FLIP_INPUT
             save_settings()
 
+    if infer_worker is not None:
+        infer_worker.stop()
     cap.release()
     cv2.destroyAllWindows()
     return 0
