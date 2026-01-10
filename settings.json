@@ -1,15 +1,15 @@
 {
-  "people_limit": 5,
+  "people_limit": 10,
   "blur_kernel_idx": 3,
-  "blur_enabled": true,
-  "mask_thresh": 70,
-  "img_size_idx": 0,
+  "blur_enabled": false,
+  "mask_thresh": 94,
+  "img_size_idx": 1,
   "high_precision_mode": true,
   "ndi_output_mask": "soft",
   "ndi_input_enabled": false,
   "ndi_output_enabled": false,
   "ndi_translations_output_enabled": true,
   "source": "video",
-  "show_detail": true,
+  "show_detail": false,
   "flip_input": true
 }
