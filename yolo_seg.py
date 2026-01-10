@@ -71,9 +71,12 @@ UI_MARGIN_LEFT = 20  # margen izquierdo para textos y GUI
 VIEW_LABEL_H = 24  # altura del label sobre cada vista
 VIEW_OFFSET_Y = 20  # baja las vistas (label + imagen) dentro del canvas
 CANVAS_WIDTH = 1536
-CANVAS_HEIGHT = 736  # 576 + gap + footer extra + offset para no reducir las vistas
+CANVAS_HEIGHT = 816  # extra altura para GUI inferior
 UI_BG_COLOR = (30, 30, 30)
 VIEW_BG_COLOR = (0, 0, 0)
+RIGHT_PANEL_FOOTER_H = 70  # espacio bajo la tercera ventana para botones
+RIGHT_PANEL_MARGIN_X = 20
+RIGHT_PANEL_ROW_GAP = 10
 VIEW_HITBOXES = []
 ACTIVE_VIEW_TAB = "mask"
 ROI_LIST = []
@@ -94,6 +97,7 @@ NDI_OUTPUT_MASK = "soft"  # "soft" o "detail"
 FOOTER_CACHE = None
 FOOTER_CACHE_KEY = None
 FOOTER_CACHE_HITBOXES = []
+FOOTER_PAD_Y = 10
 SHOW_DETAIL_DEFAULT = False
 SHOW_DETAIL = SHOW_DETAIL_DEFAULT
 FLIP_INPUT = False
@@ -559,15 +563,15 @@ def add_footer(canvas: np.ndarray, current_res: int, footer_h: int | None = None
     global UI_HITBOXES
     UI_HITBOXES = []
     if footer_h is None:
-        footer_h = 320
+        footer_h = 380
     if footer_top is None:
         footer_top = canvas.shape[0] - footer_h
     cv2.rectangle(canvas, (0, footer_top), (canvas.shape[1], canvas.shape[0]), UI_BG_COLOR, -1)
 
-    row1_y = footer_top + 12 + FOOTER_UI_OFFSET_Y
-    row2_y = footer_top + 70 + FOOTER_UI_OFFSET_Y
-    row3_y = footer_top + 130 + FOOTER_UI_OFFSET_Y
-    row4_y = footer_top + 190 + FOOTER_UI_OFFSET_Y
+    row1_y = footer_top + FOOTER_UI_OFFSET_Y + FOOTER_PAD_Y
+    row2_y = row1_y + 70 + 50
+    row3_y = row2_y + 70
+    row4_y = row3_y + 70
     btn_h = 24
     gap = 8
     x = UI_MARGIN_LEFT
@@ -614,55 +618,38 @@ def add_footer(canvas: np.ndarray, current_res: int, footer_h: int | None = None
         x += 60 + gap
 
     # Toggle buttons row (use remaining width)
-    x += 8
-    _wrap_if_needed(320)
-    blur_rect = (x, row1_y, x + 72, row1_y + btn_h)
+    x = UI_MARGIN_LEFT
+    toggle_y = row1_y + btn_h + 40
+    blur_rect = (x, toggle_y, x + 72, toggle_y + btn_h)
     _draw_button(canvas, blur_rect, "b:blur", BLUR_ENABLED, True)
     UI_HITBOXES.append({"type": "toggle", "id": "blur_enabled", "rect": blur_rect, "enabled": True})
     x += 72 + gap + 8
 
-    hi_rect = (x, row1_y, x + 90, row1_y + btn_h)
+    hi_rect = (x, toggle_y, x + 90, toggle_y + btn_h)
     _draw_button(canvas, hi_rect, "h:hi", HIGH_PRECISION_MODE, True)
     UI_HITBOXES.append({"type": "toggle", "id": "high_prec", "rect": hi_rect, "enabled": True})
     x += 90 + gap + 12
 
-    _draw_label(canvas, "MASK (m)", x, row1_y - 6)
-    soft_rect = (x, row1_y, x + 70, row1_y + btn_h)
+    _draw_label(canvas, "MASK (m)", x, toggle_y - 6)
+    soft_rect = (x, toggle_y, x + 70, toggle_y + btn_h)
     _draw_button(canvas, soft_rect, "soft", not SHOW_DETAIL, True)
     UI_HITBOXES.append({"type": "button", "id": "mask_view", "rect": soft_rect, "value": "soft", "enabled": True})
     x += 70 + gap
-    detail_rect = (x, row1_y, x + 70, row1_y + btn_h)
+    detail_rect = (x, toggle_y, x + 70, toggle_y + btn_h)
     _draw_button(canvas, detail_rect, "detail", SHOW_DETAIL, True)
     UI_HITBOXES.append({"type": "button", "id": "mask_view", "rect": detail_rect, "value": "detail", "enabled": True})
     x += 70 + gap + 12
 
-    flip_rect = (x, row1_y, x + 90, row1_y + btn_h)
+    flip_rect = (x, toggle_y, x + 90, toggle_y + btn_h)
     _draw_button(canvas, flip_rect, "f:flip", FLIP_INPUT, True)
     UI_HITBOXES.append({"type": "toggle", "id": "flip", "rect": flip_rect, "enabled": True})
     x += 90 + gap + 12
-
-    roi_enabled = len(ROI_LIST) < ROI_MAX
-    roi_rect = (x, row1_y, x + 90, row1_y + btn_h)
-    _draw_button(canvas, roi_rect, "ROI +", False, roi_enabled)
-    UI_HITBOXES.append({"type": "button", "id": "roi_add", "rect": roi_rect, "enabled": roi_enabled})
-    x += 90 + gap
-
-    roi_minus_enabled = len(ROI_LIST) > 0
-    roi_minus_rect = (x, row1_y, x + 70, row1_y + btn_h)
-    _draw_button(canvas, roi_minus_rect, "ROI -", False, roi_minus_enabled)
-    UI_HITBOXES.append({"type": "button", "id": "roi_remove", "rect": roi_minus_rect, "enabled": roi_minus_enabled})
-    x += 70 + gap
-
-    roi_reset_enabled = len(ROI_LIST) > 0
-    roi_reset_rect = (x, row1_y, x + 90, row1_y + btn_h)
-    _draw_button(canvas, roi_reset_rect, "ROI reset", False, roi_reset_enabled)
-    UI_HITBOXES.append({"type": "button", "id": "roi_reset", "rect": roi_reset_rect, "enabled": roi_reset_enabled})
 
     # NDI toggles moved to per-view bottom-left corners.
 
     # Row 2: PEOPLE slider + BLUR kernel
     x = UI_MARGIN_LEFT
-    people_rect = (x, row2_y + 10, x + 320, row2_y + 22)
+    people_rect = (x, row2_y + 20, x + 260, row2_y + 32)
     _draw_slider(
         canvas,
         people_rect,
@@ -673,9 +660,9 @@ def add_footer(canvas: np.ndarray, current_res: int, footer_h: int | None = None
         str(CURRENT_PEOPLE_LIMIT),
     )
     UI_HITBOXES.append({"type": "slider", "id": "people", "rect": people_rect})
-    x += 320 + 80
+    x += 260 + 60
 
-    kernel_rect = (x, row2_y + 10, x + 260, row2_y + 22)
+    kernel_rect = (x, row2_y + 20, x + 220, row2_y + 32)
     _draw_slider(
         canvas,
         kernel_rect,
@@ -689,12 +676,12 @@ def add_footer(canvas: np.ndarray, current_res: int, footer_h: int | None = None
 
     # Row 3: THRESH + IMG SIZE
     x = UI_MARGIN_LEFT
-    thresh_rect = (x, row3_y + 10, x + 420, row3_y + 22)
+    thresh_rect = (x, row3_y + 20, x + 340, row3_y + 32)
     _draw_slider(canvas, thresh_rect, MASK_THRESH, 0, 255, "THRESH (j/k)", str(MASK_THRESH))
     UI_HITBOXES.append({"type": "slider", "id": "mask_thresh", "rect": thresh_rect})
-    x += 420 + 80
+    x += 340 + 60
 
-    imgsz_rect = (x, row3_y + 10, x + 260, row3_y + 22)
+    imgsz_rect = (x, row3_y + 20, x + 220, row3_y + 32)
     _draw_slider(
         canvas,
         imgsz_rect,
@@ -708,7 +695,7 @@ def add_footer(canvas: np.ndarray, current_res: int, footer_h: int | None = None
 
     # Row 4: persistence sliders
     x = UI_MARGIN_LEFT
-    hold_rect = (x, row4_y + 10, x + 320, row4_y + 22)
+    hold_rect = (x, row4_y + 20, x + 260, row4_y + 32)
     _draw_slider(
         canvas,
         hold_rect,
@@ -719,9 +706,9 @@ def add_footer(canvas: np.ndarray, current_res: int, footer_h: int | None = None
         f"{PERSIST_HOLD_SEC:.2f}s",
     )
     UI_HITBOXES.append({"type": "slider", "id": "persist_hold", "rect": hold_rect})
-    x += 320 + 80
+    x += 260 + 60
 
-    rise_rect = (x, row4_y + 10, x + 260, row4_y + 22)
+    rise_rect = (x, row4_y + 20, x + 220, row4_y + 32)
     _draw_slider(
         canvas,
         rise_rect,
@@ -732,9 +719,9 @@ def add_footer(canvas: np.ndarray, current_res: int, footer_h: int | None = None
         f"{PERSIST_RISE_TAU:.2f}s",
     )
     UI_HITBOXES.append({"type": "slider", "id": "persist_rise", "rect": rise_rect})
-    x += 260 + 60
+    x += 220 + 60
 
-    fall_rect = (x, row4_y + 10, x + 260, row4_y + 22)
+    fall_rect = (x, row4_y + 20, x + 220, row4_y + 32)
     _draw_slider(
         canvas,
         fall_rect,
@@ -745,6 +732,8 @@ def add_footer(canvas: np.ndarray, current_res: int, footer_h: int | None = None
         f"{PERSIST_FALL_TAU:.2f}s",
     )
     UI_HITBOXES.append({"type": "slider", "id": "persist_fall", "rect": fall_rect})
+
+    # Bottom row for right panel moved to main canvas.
 
 
 def _point_in_rect(x: int, y: int, rect: Tuple[int, int, int, int]) -> bool:
@@ -935,8 +924,6 @@ def on_mouse(event: int, x: int, y: int, flags: int, param: Any) -> None:
             if rx1 <= local_x <= rx2 and ry1 <= local_y <= ry2:
                 target_idx = idx
                 break
-        if target_idx is None and ROI_ACTIVE_IDX is not None:
-            target_idx = ROI_ACTIVE_IDX
         if target_idx is None:
             return
         roi = ROI_LIST[target_idx]
@@ -1478,7 +1465,7 @@ def main():
     window_name = "NEXT2 VISION - ROTOR STUDIO"
     canvas_size = (CANVAS_WIDTH, CANVAS_HEIGHT)  # width, height (3 panels + gap)
     header_h = 40
-    footer_h = 320
+    footer_h = 380
     cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE | cv2.WINDOW_GUI_NORMAL)
     cv2.setMouseCallback(window_name, on_mouse)
     frame_idx = 0
@@ -1581,6 +1568,7 @@ def main():
         canvas = np.full((canvas_size[1], canvas_size[0], 3), UI_BG_COLOR, dtype=np.uint8)
         view_h = canvas_size[1] - header_h - footer_h - FOOTER_GAP_PX - VIEW_OFFSET_Y
         third_w = canvas_size[0] // 3
+        right_view_h = canvas_size[1] - header_h - VIEW_OFFSET_Y - RIGHT_PANEL_FOOTER_H
         view_y = header_h + VIEW_OFFSET_Y
         VIEW_HITBOXES = []
 
@@ -1607,7 +1595,7 @@ def main():
                 ACTIVE_VIEW_TAB,
             )
         roi_w = third_w
-        roi_h = max(1, view_h - VIEW_LABEL_H)
+        roi_h = max(1, right_view_h - VIEW_LABEL_H)
         if cached_translated is None or ROI_DIRTY or do_process:
             translated = translate_masks_to_rois(
                 person_masks, ROI_LIST, (roi_w, roi_h), now, max(dt, 1e-6)
@@ -1625,7 +1613,7 @@ def main():
             (("mask", "Mask"), ("mod", "Suavizado")),
             ACTIVE_VIEW_TAB,
         )
-        right_view = make_labeled_view(right_image, "Traslaciones", (third_w, view_h))
+        right_view = make_labeled_view(right_image, "Traslaciones", (third_w, right_view_h))
 
         ROI_PANEL_BOUNDS = (roi_w, roi_h)
         ROI_PANEL_BOUNDS_ABS = (
@@ -1673,9 +1661,33 @@ def main():
         border_bottom = view_y + view_h - 1
         cv2.rectangle(canvas, (0, border_top), (third_w - 1, border_bottom), border_color, 1)
         cv2.rectangle(canvas, (third_w, border_top), (2 * third_w - 1, border_bottom), border_color, 1)
-        cv2.rectangle(canvas, (2 * third_w, border_top), (3 * third_w - 1, border_bottom), border_color, 1)
+        right_border_bottom = view_y + right_view_h - 1
+        cv2.rectangle(canvas, (2 * third_w, border_top), (3 * third_w - 1, right_border_bottom), border_color, 1)
 
-        btn_h = 22
+        # Right panel controls (ROI +/-, reset, NDI TR) under the third window.
+        right_x0 = 2 * third_w
+        btn_h = 24
+        gap = 8
+        x = right_x0 + RIGHT_PANEL_MARGIN_X
+        y = view_y + right_view_h + RIGHT_PANEL_ROW_GAP
+        max_x = right_x0 + third_w - RIGHT_PANEL_MARGIN_X
+
+        def _place_right_button(label: str, width: int, active: bool, enabled: bool, item_id: str) -> None:
+            nonlocal x, y
+            if x + width > max_x:
+                y += btn_h + RIGHT_PANEL_ROW_GAP
+                x = right_x0 + RIGHT_PANEL_MARGIN_X
+            rect = (x, y, x + width, y + btn_h)
+            _draw_button(canvas, rect, label, active, enabled)
+            VIEW_HITBOXES.append({"type": "button" if item_id.startswith("roi") else "toggle", "id": item_id, "rect": rect, "enabled": enabled})
+            x += width + gap
+
+        _place_right_button("ROI +", 90, False, len(ROI_LIST) < ROI_MAX, "roi_add")
+        _place_right_button("ROI -", 70, False, len(ROI_LIST) > 0, "roi_remove")
+        _place_right_button("ROI reset", 90, False, len(ROI_LIST) > 0, "roi_reset")
+        _place_right_button("NDI TR", 120, ENABLE_NDI_TRANSLATIONS_OUTPUT, ENABLE_NDI, "ndi_trans_output")
+
+        btn_h = 24
         pad = 8
         btn_w = 90
         btn_y = view_y + view_h + 10
@@ -1689,20 +1701,15 @@ def main():
         _draw_button(canvas, mid_btn, "NDI OUT", ENABLE_NDI_OUTPUT, ENABLE_NDI)
         VIEW_HITBOXES.append({"type": "toggle", "id": "ndi_output", "rect": mid_btn, "enabled": ENABLE_NDI})
 
-        right_x0 = 2 * third_w
-        right_btn = (right_x0 + pad, btn_y, right_x0 + pad + 110, btn_y + btn_h)
-        _draw_button(canvas, right_btn, "NDI TR", ENABLE_NDI_TRANSLATIONS_OUTPUT, ENABLE_NDI)
-        VIEW_HITBOXES.append(
-            {"type": "toggle", "id": "ndi_trans_output", "rect": right_btn, "enabled": ENABLE_NDI}
-        )
 
         res_text = f"{frame.shape[1]}x{frame.shape[0]}"
         people_count = len(boxes) if boxes is not None else 0
         add_header(canvas, fps, DEVICE, res_text, people_count, source_label())
 
         footer_top = canvas.shape[0] - footer_h
+        left_footer_w = third_w * 2
         footer_key = (
-            canvas.shape[1],
+            left_footer_w,
             footer_h,
             CURRENT_MAX_HEIGHT,
             CURRENT_PEOPLE_LIMIT,
@@ -1725,7 +1732,7 @@ def main():
             round(PERSIST_FALL_TAU, 3),
         )
         if FOOTER_CACHE is None or FOOTER_CACHE_KEY != footer_key:
-            footer_layer = np.full((footer_h, canvas.shape[1], 3), UI_BG_COLOR, dtype=np.uint8)
+            footer_layer = np.full((footer_h, left_footer_w, 3), UI_BG_COLOR, dtype=np.uint8)
             add_footer(footer_layer, CURRENT_MAX_HEIGHT, footer_h=footer_h, footer_top=0)
             FOOTER_CACHE = footer_layer
             FOOTER_CACHE_KEY = footer_key
@@ -1734,7 +1741,7 @@ def main():
             UI_HITBOXES = [item.copy() for item in FOOTER_CACHE_HITBOXES]
 
         if FOOTER_CACHE is not None:
-            canvas[-footer_h:, :] = FOOTER_CACHE
+            canvas[-footer_h:, :left_footer_w] = FOOTER_CACHE
         # Offset cached hitboxes to absolute canvas coordinates.
         for item in UI_HITBOXES:
             x1, y1, x2, y2 = item["rect"]
