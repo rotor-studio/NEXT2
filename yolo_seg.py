@@ -81,8 +81,9 @@ ROI_ACTIVE_IDX = None
 ROI_DRAG_OFFSET = (0, 0)
 ROI_PANEL_BOUNDS = None  # (w, h) for right panel image area (local)
 ROI_PANEL_BOUNDS_ABS = None  # (x0, y0, w, h) absolute for mouse
-ROI_MAX = 3
+ROI_MAX = 10
 ROI_STATE = []  # per-ROI assignment state (centroids/persistence)
+ROI_DIRTY = False
 
 # UI state (footer GUI)
 UI_HITBOXES = []
@@ -90,6 +91,9 @@ UI_ACTIVE_SLIDER = None
 UI_PENDING_MODEL_KEY = None
 UI_PENDING_SOURCE = None
 NDI_OUTPUT_MASK = "soft"  # "soft" o "detail"
+FOOTER_CACHE = None
+FOOTER_CACHE_KEY = None
+FOOTER_CACHE_HITBOXES = []
 SHOW_DETAIL_DEFAULT = False
 SHOW_DETAIL = SHOW_DETAIL_DEFAULT
 FLIP_INPUT = False
@@ -132,7 +136,12 @@ def capture_frame(cap: cv2.VideoCapture):
 
 # --------------- segmentación --------------------------------------
 def segment_people(
-    frame: np.ndarray, model: YOLO, people_limit: int, mask_thresh: int, blur_enabled: bool
+    frame: np.ndarray,
+    model: YOLO,
+    people_limit: int,
+    mask_thresh: int,
+    blur_enabled: bool,
+    compute_person_masks: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, list]:
     """
     Run YOLOv8 segmentation and return:
@@ -170,14 +179,15 @@ def segment_people(
 
     # Aggregate soft mask (float) to keep fine contours before thresholding.
     person_mask = np.zeros((h, w), dtype=np.float32)
-    person_masks = []
+    person_masks = [] if compute_person_masks else None
     person_boxes = []
     for idx in person_indices:
         m = masks[idx]
         # Resize mask from model space to frame space; keep float precision for later threshold.
         m_resized = cv2.resize(m, (w, h), interpolation=cv2.INTER_LINEAR)
         person_mask = np.maximum(person_mask, m_resized)
-        person_masks.append(m_resized)
+        if compute_person_masks:
+            person_masks.append(m_resized)
         person_boxes.append(boxes_all[idx])
 
     # Convert to uint8 scale 0-255 for morphology/thresholding.
@@ -202,14 +212,15 @@ def segment_people(
     mask_soft = cv2.morphologyEx(mask_soft, cv2.MORPH_CLOSE, morph_kernel, iterations=1)
 
     person_masks_soft = []
-    for m in person_masks:
-        m_u8 = np.clip(m * 255.0, 0, 255).astype(np.uint8)
-        _, m_u8 = cv2.threshold(m_u8, mask_thresh, 255, cv2.THRESH_BINARY)
-        if ksize > 1:
-            m_u8 = cv2.GaussianBlur(m_u8, (ksize, ksize), 0)
+    if compute_person_masks and person_masks:
+        for m in person_masks:
+            m_u8 = np.clip(m * 255.0, 0, 255).astype(np.uint8)
             _, m_u8 = cv2.threshold(m_u8, mask_thresh, 255, cv2.THRESH_BINARY)
-        m_u8 = cv2.morphologyEx(m_u8, cv2.MORPH_CLOSE, morph_kernel, iterations=1)
-        person_masks_soft.append(m_u8)
+            if ksize > 1:
+                m_u8 = cv2.GaussianBlur(m_u8, (ksize, ksize), 0)
+                _, m_u8 = cv2.threshold(m_u8, mask_thresh, 255, cv2.THRESH_BINARY)
+            m_u8 = cv2.morphologyEx(m_u8, cv2.MORPH_CLOSE, morph_kernel, iterations=1)
+            person_masks_soft.append(m_u8)
     return mask_soft, mask_detail, np.array(person_boxes), person_masks_soft
 
 
@@ -316,7 +327,7 @@ def _clamp_roi(roi: dict, w: int, h: int) -> None:
 
 
 def add_roi() -> None:
-    global ROI_LIST
+    global ROI_LIST, ROI_DIRTY
     if ROI_PANEL_BOUNDS is None or len(ROI_LIST) >= ROI_MAX:
         return
     w, h = ROI_PANEL_BOUNDS
@@ -324,6 +335,7 @@ def add_roi() -> None:
     roi = {"cx": w // 2, "cy": h // 2, "half": half}
     _clamp_roi(roi, w, h)
     ROI_LIST.append(roi)
+    ROI_DIRTY = True
 
 
 def translate_masks_to_rois(
@@ -492,7 +504,7 @@ def add_header(canvas: np.ndarray, fps: float, device: str, res_text: str, peopl
     current_model_label = MODEL_OPTIONS.get(CURRENT_MODEL_KEY, (CURRENT_MODEL_PATH, CURRENT_MODEL_PATH))[1]
     fps_str = f"{fps:06.1f}"  # ancho fijo para evitar saltos en el texto
     text = (
-        f"SRC: {source_label} | RES: {res_text} | FPS: {fps_str} | GPU: {device} | "
+        f"SRC: {source_label} | RES: {res_text} | MAXH: {CURRENT_MAX_HEIGHT} | FPS: {fps_str} | GPU: {device} | "
         f"MODEL: {current_model_label} | PEOPLE NOW: {people_count} | PREC: {'HIGH' if HIGH_PRECISION_MODE else 'NORM'}"
     )
     cv2.putText(canvas, text, (UI_MARGIN_LEFT, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
@@ -542,12 +554,14 @@ def _draw_slider(
     cv2.putText(canvas, value_text, (x2 + 8, y2 + 1), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1)
 
 
-def add_footer(canvas: np.ndarray, current_res: int) -> None:
+def add_footer(canvas: np.ndarray, current_res: int, footer_h: int | None = None, footer_top: int | None = None) -> None:
     """Draw footer GUI with mouse-interactive controls."""
     global UI_HITBOXES
     UI_HITBOXES = []
-    footer_h = 320
-    footer_top = canvas.shape[0] - footer_h
+    if footer_h is None:
+        footer_h = 320
+    if footer_top is None:
+        footer_top = canvas.shape[0] - footer_h
     cv2.rectangle(canvas, (0, footer_top), (canvas.shape[1], canvas.shape[0]), UI_BG_COLOR, -1)
 
     row1_y = footer_top + 12 + FOOTER_UI_OFFSET_Y
@@ -740,7 +754,7 @@ def _point_in_rect(x: int, y: int, rect: Tuple[int, int, int, int]) -> bool:
 
 def _apply_button_action(item: dict) -> None:
     global UI_PENDING_MODEL_KEY, UI_PENDING_SOURCE, SHOW_DETAIL, FLIP_INPUT, HIGH_PRECISION_MODE
-    global BLUR_ENABLED, ROI_LIST, ROI_STATE
+    global BLUR_ENABLED, ROI_LIST, ROI_STATE, ROI_DIRTY
     global ENABLE_NDI_INPUT, ENABLE_NDI_OUTPUT, ENABLE_NDI_TRANSLATIONS_OUTPUT, CURRENT_SOURCE
     item_id = item["id"]
     if item_id == "res":
@@ -776,10 +790,12 @@ def _apply_button_action(item: dict) -> None:
         if ROI_LIST:
             ROI_LIST.pop()
             ROI_STATE = ROI_STATE[: len(ROI_LIST)]
+            ROI_DIRTY = True
         return
     if item_id == "roi_reset":
         ROI_LIST.clear()
         ROI_STATE.clear()
+        ROI_DIRTY = True
         return
     if item_id == "ndi_input":
         ENABLE_NDI_INPUT = not ENABLE_NDI_INPUT
@@ -854,7 +870,7 @@ def _apply_slider_action(item: dict, x: int) -> None:
 
 
 def on_mouse(event: int, x: int, y: int, flags: int, param: Any) -> None:
-    global UI_ACTIVE_SLIDER, ROI_ACTIVE_IDX, ROI_DRAG_OFFSET
+    global UI_ACTIVE_SLIDER, ROI_ACTIVE_IDX, ROI_DRAG_OFFSET, ROI_DIRTY
 
     if event == cv2.EVENT_LBUTTONDOWN:
         if ROI_PANEL_BOUNDS_ABS is not None:
@@ -894,6 +910,7 @@ def on_mouse(event: int, x: int, y: int, flags: int, param: Any) -> None:
             roi["cx"] = int(local_x + dx)
             roi["cy"] = int(local_y + dy)
             _clamp_roi(roi, bw, bh)
+            ROI_DIRTY = True
             return
         if UI_ACTIVE_SLIDER is not None and flags & cv2.EVENT_FLAG_LBUTTON:
             _apply_slider_action(UI_ACTIVE_SLIDER, x)
@@ -926,6 +943,7 @@ def on_mouse(event: int, x: int, y: int, flags: int, param: Any) -> None:
         step = 6 if delta > 0 else -6
         roi["half"] = int(roi["half"]) + step
         _clamp_roi(roi, bw, bh)
+        ROI_DIRTY = True
         return
 
     if event == cv2.EVENT_LBUTTONUP:
@@ -1406,6 +1424,7 @@ def main():
     global BLUR_KERNEL_IDX, MASK_THRESH, BLUR_ENABLED, IMG_SIZE_IDX, HIGH_PRECISION_MODE, ENABLE_NDI, DEFAULT_SOURCE, SHOW_DETAIL, FLIP_INPUT
     global ENABLE_NDI_INPUT, ENABLE_NDI_OUTPUT, ENABLE_NDI_TRANSLATIONS_OUTPUT
     global UI_PENDING_MODEL_KEY, UI_PENDING_SOURCE, VIEW_HITBOXES, ROI_PANEL_BOUNDS, ROI_PANEL_BOUNDS_ABS
+    global FOOTER_CACHE, FOOTER_CACHE_KEY, FOOTER_CACHE_HITBOXES, UI_HITBOXES
     load_saved_resolution()
     load_saved_model()
     load_settings()
@@ -1466,8 +1485,12 @@ def main():
     last_mask_soft = None
     last_mask_detail = None
     last_boxes = None
+    last_boxed = None
     last_person_masks = []
     last_frame = None
+    cached_middle_view = None
+    cached_middle_key = None
+    cached_translated = None
     persist_mask = None
     last_detect_time = None
     last_detect_mask = None
@@ -1508,8 +1531,9 @@ def main():
 
         do_process = (frame_idx % PROCESS_EVERY_N == 0 or last_mask_soft is None) and got_new_frame
         if do_process:
+            need_person_masks = len(ROI_LIST) > 0
             mask_soft, mask_detail, boxes, person_masks = segment_people(
-                frame, model, CURRENT_PEOPLE_LIMIT, MASK_THRESH, BLUR_ENABLED
+                frame, model, CURRENT_PEOPLE_LIMIT, MASK_THRESH, BLUR_ENABLED, compute_person_masks=need_person_masks
             )
             last_mask_soft, last_mask_detail, last_boxes, last_person_masks = (
                 mask_soft,
@@ -1536,7 +1560,11 @@ def main():
             if mask_detail is None:
                 mask_detail = fallback_mask
 
-        boxed = draw_boxes(frame, boxes)
+        if do_process or last_boxed is None:
+            boxed = draw_boxes(frame, boxes)
+            last_boxed = boxed
+        else:
+            boxed = last_boxed
 
         # FPS + persistencia.
         now = time.time()
@@ -1558,16 +1586,36 @@ def main():
 
         left_view = fit_to_box(boxed, (third_w, view_h))
         mask_to_show = mask_detail if show_detail else mask_soft
-        middle_image = (
-            cv2.cvtColor(mask_to_show, cv2.COLOR_GRAY2BGR)
-            if ACTIVE_VIEW_TAB == "mask"
-            else cv2.cvtColor(persist_u8, cv2.COLOR_GRAY2BGR)
-        )
+        if ACTIVE_VIEW_TAB == "mask":
+            middle_key = (show_detail, id(mask_soft), id(mask_detail), ACTIVE_VIEW_TAB)
+            if cached_middle_view is None or cached_middle_key != middle_key:
+                middle_image = cv2.cvtColor(mask_to_show, cv2.COLOR_GRAY2BGR)
+                cached_middle_view = make_tabbed_view(
+                    middle_image,
+                    (third_w, view_h),
+                    (("mask", "Mask"), ("mod", "Suavizado")),
+                    ACTIVE_VIEW_TAB,
+                )
+                cached_middle_key = middle_key
+            middle_view, tab_rects = cached_middle_view
+        else:
+            middle_image = cv2.cvtColor(persist_u8, cv2.COLOR_GRAY2BGR)
+            middle_view, tab_rects = make_tabbed_view(
+                middle_image,
+                (third_w, view_h),
+                (("mask", "Mask"), ("mod", "Suavizado")),
+                ACTIVE_VIEW_TAB,
+            )
         roi_w = third_w
         roi_h = max(1, view_h - VIEW_LABEL_H)
-        translated = translate_masks_to_rois(
-            person_masks, ROI_LIST, (roi_w, roi_h), now, max(dt, 1e-6)
-        )
+        if cached_translated is None or ROI_DIRTY or do_process:
+            translated = translate_masks_to_rois(
+                person_masks, ROI_LIST, (roi_w, roi_h), now, max(dt, 1e-6)
+            )
+            cached_translated = translated
+            ROI_DIRTY = False
+        else:
+            translated = cached_translated
         right_image = cv2.cvtColor(translated, cv2.COLOR_GRAY2BGR)
 
         left_view = make_labeled_view(left_view, "Original + Boxes", (third_w, view_h))
@@ -1651,7 +1699,46 @@ def main():
         res_text = f"{frame.shape[1]}x{frame.shape[0]}"
         people_count = len(boxes) if boxes is not None else 0
         add_header(canvas, fps, DEVICE, res_text, people_count, source_label())
-        add_footer(canvas, CURRENT_MAX_HEIGHT)
+
+        footer_top = canvas.shape[0] - footer_h
+        footer_key = (
+            canvas.shape[1],
+            footer_h,
+            CURRENT_MAX_HEIGHT,
+            CURRENT_PEOPLE_LIMIT,
+            BLUR_KERNEL_IDX,
+            BLUR_ENABLED,
+            MASK_THRESH,
+            IMG_SIZE_IDX,
+            HIGH_PRECISION_MODE,
+            SHOW_DETAIL,
+            FLIP_INPUT,
+            CURRENT_SOURCE,
+            bool(VIDEO_FILES),
+            ENABLE_NDI,
+            ENABLE_NDI_INPUT,
+            ENABLE_NDI_OUTPUT,
+            ENABLE_NDI_TRANSLATIONS_OUTPUT,
+            len(ROI_LIST),
+            round(PERSIST_HOLD_SEC, 3),
+            round(PERSIST_RISE_TAU, 3),
+            round(PERSIST_FALL_TAU, 3),
+        )
+        if FOOTER_CACHE is None or FOOTER_CACHE_KEY != footer_key:
+            footer_layer = np.full((footer_h, canvas.shape[1], 3), UI_BG_COLOR, dtype=np.uint8)
+            add_footer(footer_layer, CURRENT_MAX_HEIGHT, footer_h=footer_h, footer_top=0)
+            FOOTER_CACHE = footer_layer
+            FOOTER_CACHE_KEY = footer_key
+            FOOTER_CACHE_HITBOXES = [item.copy() for item in UI_HITBOXES]
+        else:
+            UI_HITBOXES = [item.copy() for item in FOOTER_CACHE_HITBOXES]
+
+        if FOOTER_CACHE is not None:
+            canvas[-footer_h:, :] = FOOTER_CACHE
+        # Offset cached hitboxes to absolute canvas coordinates.
+        for item in UI_HITBOXES:
+            x1, y1, x2, y2 = item["rect"]
+            item["rect"] = (x1, y1 + footer_top, x2, y2 + footer_top)
 
         # Publicación NDI (máscara) - por defecto la suave; cambiar a mask_detail si se desea.
         if ENABLE_NDI and ENABLE_NDI_OUTPUT and ndi_pub is None:
