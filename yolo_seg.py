@@ -1241,34 +1241,44 @@ def main():
         persist_u8 = np.clip(persist_mask * 255.0, 0, 255).astype(np.uint8)
         print(f"FPS: {fps:0.2f}", end="\r", flush=True)
 
-        # Composición en ventana única: vista izquierda + panel tabbed a la derecha.
+        # Composición en ventana única: tres vistas (izquierda + panel tabbed + derecha).
         canvas = np.full((canvas_size[1], canvas_size[0], 3), UI_BG_COLOR, dtype=np.uint8)
         view_h = canvas_size[1] - header_h - footer_h - FOOTER_GAP_PX - VIEW_OFFSET_Y
-        half_w = canvas_size[0] // 2
+        third_w = canvas_size[0] // 3
         view_y = header_h + VIEW_OFFSET_Y
         VIEW_HITBOXES = []
 
-        left_view = fit_to_box(boxed, (half_w, view_h))
+        left_view = fit_to_box(boxed, (third_w, view_h))
         mask_to_show = mask_detail if show_detail else mask_soft
-        right_image = (
+        middle_image = (
             cv2.cvtColor(mask_to_show, cv2.COLOR_GRAY2BGR)
             if ACTIVE_VIEW_TAB == "mask"
             else cv2.cvtColor(persist_u8, cv2.COLOR_GRAY2BGR)
         )
+        right_image = np.zeros((view_h, third_w, 3), dtype=np.uint8)
 
-        left_view = make_labeled_view(left_view, "Original + Boxes", (half_w, view_h))
-        right_view, tab_rects = make_tabbed_view(
-            right_image, (half_w, view_h), (("mask", "Mask"), ("mod", "Suavizado")), ACTIVE_VIEW_TAB
+        left_view = make_labeled_view(left_view, "Original + Boxes", (third_w, view_h))
+        middle_view, tab_rects = make_tabbed_view(
+            middle_image,
+            (third_w, view_h),
+            (("mask", "Mask"), ("mod", "Suavizado")),
+            ACTIVE_VIEW_TAB,
         )
+        right_view = make_labeled_view(right_image, "Traslaciones", (third_w, view_h))
 
-        canvas[view_y : view_y + left_view.shape[0], 0:half_w] = left_view
-        canvas[view_y : view_y + right_view.shape[0], half_w : half_w + right_view.shape[1]] = right_view
+        canvas[view_y : view_y + left_view.shape[0], 0:third_w] = left_view
+        canvas[
+            view_y : view_y + middle_view.shape[0], third_w : third_w + middle_view.shape[1]
+        ] = middle_view
+        canvas[
+            view_y : view_y + right_view.shape[0], 2 * third_w : 2 * third_w + right_view.shape[1]
+        ] = right_view
 
         for key, rect in tab_rects:
             abs_rect = (
-                half_w + rect[0],
+                third_w + rect[0],
                 view_y + rect[1],
-                half_w + rect[2],
+                third_w + rect[2],
                 view_y + rect[3],
             )
             VIEW_HITBOXES.append({"type": "view_tab", "rect": abs_rect, "value": key, "enabled": True})
@@ -1276,8 +1286,9 @@ def main():
         border_color = (200, 200, 200)
         border_top = view_y + VIEW_LABEL_H
         border_bottom = view_y + view_h - 1
-        cv2.rectangle(canvas, (0, border_top), (half_w - 1, border_bottom), border_color, 1)
-        cv2.rectangle(canvas, (half_w, border_top), (2 * half_w - 1, border_bottom), border_color, 1)
+        cv2.rectangle(canvas, (0, border_top), (third_w - 1, border_bottom), border_color, 1)
+        cv2.rectangle(canvas, (third_w, border_top), (2 * third_w - 1, border_bottom), border_color, 1)
+        cv2.rectangle(canvas, (2 * third_w, border_top), (3 * third_w - 1, border_bottom), border_color, 1)
 
         res_text = f"{frame.shape[1]}x{frame.shape[0]}"
         people_count = len(boxes) if boxes is not None else 0
