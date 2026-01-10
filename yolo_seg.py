@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import sys
 import time
-from typing import Tuple, Any
+import math
+from typing import Tuple, Any, Optional
 import os
 import multiprocessing as mp
 from pathlib import Path
@@ -59,6 +60,26 @@ BLUR_KERNEL_IDX = 2  # valor inicial -> kernel 5
 MASK_THRESH = 127
 BLUR_ENABLED = True
 HIGH_PRECISION_MODE = False  # modo alta precisión (imgsz alto y sin blur en mask_detail)
+PERSIST_HOLD_SEC = 0.35  # segundos para mantener silueta tras perder detección
+PERSIST_RISE_TAU = 0.12  # segundos para fade-in
+PERSIST_FALL_TAU = 0.25  # segundos para fade-out
+FOOTER_GAP_PX = 40  # separación entre vistas y GUI inferior
+FOOTER_UI_OFFSET_Y = 40  # baja el GUI dentro del footer
+UI_MARGIN_LEFT = 20  # margen izquierdo para textos y GUI
+VIEW_LABEL_H = 24  # altura del label sobre cada vista
+VIEW_OFFSET_Y = 20  # baja las vistas (label + imagen) dentro del canvas
+CANVAS_WIDTH = 1536
+CANVAS_HEIGHT = 736  # 576 + gap + footer extra + offset para no reducir las vistas
+UI_BG_COLOR = (30, 30, 30)
+VIEW_BG_COLOR = (0, 0, 0)
+VIEW_HITBOXES = []
+ACTIVE_VIEW_TAB = "mask"
+
+# UI state (footer GUI)
+UI_HITBOXES = []
+UI_ACTIVE_SLIDER = None
+UI_PENDING_MODEL_KEY = None
+UI_PENDING_SOURCE = None
 NDI_OUTPUT_MASK = "soft"  # "soft" o "detail"
 SHOW_DETAIL_DEFAULT = False
 SHOW_DETAIL = SHOW_DETAIL_DEFAULT
@@ -202,10 +223,88 @@ def fit_to_box(image: np.ndarray, box_size: Tuple[int, int]) -> np.ndarray:
 
 
 def add_overlay(image: np.ndarray, label: str) -> np.ndarray:
-    """Add label overlay to an image (top-left) with small white text."""
+    """Backwards-compatible wrapper (deprecated)."""
     overlay = image.copy()
-    cv2.putText(overlay, label, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+    cv2.putText(overlay, label, (UI_MARGIN_LEFT, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
     return overlay
+
+
+def make_labeled_view(image: np.ndarray, label: str, box_size: Tuple[int, int]) -> np.ndarray:
+    """Place label above the image; image is fitted below the label strip."""
+    box_w, box_h = box_size
+    label_h = min(VIEW_LABEL_H, max(16, box_h // 6))
+    view = np.full((box_h, box_w, 3), VIEW_BG_COLOR, dtype=np.uint8)
+    cv2.rectangle(view, (0, 0), (box_w - 1, label_h), UI_BG_COLOR, -1)
+    cv2.putText(view, label, (UI_MARGIN_LEFT, label_h - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (235, 235, 235), 1)
+    if box_h - label_h > 0:
+        fitted = fit_to_box(image, (box_w, box_h - label_h))
+        view[label_h : label_h + fitted.shape[0], 0 : fitted.shape[1]] = fitted
+    return view
+
+
+def make_tabbed_view(
+    image: np.ndarray, box_size: Tuple[int, int], tabs: Tuple[Tuple[str, str], ...], active_key: str
+) -> Tuple[np.ndarray, list]:
+    """Create a view with a tab bar on top; returns view and tab rects (relative)."""
+    box_w, box_h = box_size
+    label_h = min(VIEW_LABEL_H, max(16, box_h // 6))
+    view = np.full((box_h, box_w, 3), VIEW_BG_COLOR, dtype=np.uint8)
+    cv2.rectangle(view, (0, 0), (box_w - 1, label_h), UI_BG_COLOR, -1)
+
+    tab_rects = []
+    x = UI_MARGIN_LEFT
+    for key, label in tabs:
+        text_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
+        tab_w = max(70, text_size[0] + 20)
+        rect = (x, 2, min(x + tab_w, box_w - 4), label_h - 2)
+        is_active = key == active_key
+        fill = (70, 70, 70) if is_active else (45, 45, 45)
+        cv2.rectangle(view, (rect[0], rect[1]), (rect[2], rect[3]), fill, -1)
+        cv2.rectangle(view, (rect[0], rect[1]), (rect[2], rect[3]), (90, 90, 90), 1)
+        ty = rect[1] + (rect[3] - rect[1] + text_size[1]) // 2
+        tx = rect[0] + (rect[2] - rect[0] - text_size[0]) // 2
+        cv2.putText(view, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (235, 235, 235), 1)
+        tab_rects.append((key, rect))
+        x = rect[2] + 8
+
+    if box_h - label_h > 0:
+        fitted = fit_to_box(image, (box_w, box_h - label_h))
+        view[label_h : label_h + fitted.shape[0], 0 : fitted.shape[1]] = fitted
+    return view, tab_rects
+
+
+def update_persistent_mask(
+    persist_mask: Optional[np.ndarray],
+    mask_binary: np.ndarray,
+    last_detect_time: Optional[float],
+    last_detect_mask: Optional[np.ndarray],
+    now: float,
+    dt: float,
+) -> Tuple[np.ndarray, Optional[float], Optional[np.ndarray]]:
+    """Temporal smoothing + hold to reduce flicker; returns float mask in [0,1]."""
+    if persist_mask is None or persist_mask.shape != mask_binary.shape:
+        persist_mask = np.zeros(mask_binary.shape, dtype=np.float32)
+        last_detect_mask = None
+
+    has_detection = np.any(mask_binary > 0)
+    if has_detection:
+        last_detect_time = now
+        last_detect_mask = (mask_binary > 0).astype(np.float32)
+
+    if last_detect_mask is not None and last_detect_mask.shape != persist_mask.shape:
+        last_detect_mask = None
+    if last_detect_time is not None and (now - last_detect_time) <= PERSIST_HOLD_SEC:
+        target_on = last_detect_mask if last_detect_mask is not None else np.zeros_like(persist_mask)
+    else:
+        target_on = np.zeros_like(persist_mask)
+
+    rise_rate = 1.0 - math.exp(-dt / max(PERSIST_RISE_TAU, 1e-6))
+    fall_rate = 1.0 - math.exp(-dt / max(PERSIST_FALL_TAU, 1e-6))
+
+    on_mask = target_on > 0.0
+    persist_mask[on_mask] = (1.0 - rise_rate) * persist_mask[on_mask] + rise_rate * 1.0
+    persist_mask[~on_mask] = (1.0 - fall_rate) * persist_mask[~on_mask]
+    return persist_mask, last_detect_time, last_detect_mask
 
 
 def draw_boxes(frame: np.ndarray, boxes: np.ndarray) -> np.ndarray:
@@ -227,51 +326,339 @@ def add_header(canvas: np.ndarray, fps: float, device: str, res_text: str, peopl
         f"SRC: {source_label} | RES: {res_text} | FPS: {fps_str} | GPU: {device} | "
         f"MODEL: {current_model_label} | PEOPLE NOW: {people_count} | PREC: {'HIGH' if HIGH_PRECISION_MODE else 'NORM'}"
     )
-    cv2.putText(canvas, text, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+    cv2.putText(canvas, text, (UI_MARGIN_LEFT, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+
+
+def _draw_label(canvas: np.ndarray, text: str, x: int, y: int) -> None:
+    cv2.putText(canvas, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1)
+
+
+def _draw_button(canvas: np.ndarray, rect: Tuple[int, int, int, int], text: str, active: bool, enabled: bool) -> None:
+    x1, y1, x2, y2 = rect
+    if not enabled:
+        fill = (40, 40, 40)
+        text_color = (120, 120, 120)
+    else:
+        fill = (70, 120, 70) if active else (60, 60, 60)
+        text_color = (235, 235, 235)
+    cv2.rectangle(canvas, (x1, y1), (x2, y2), fill, -1)
+    cv2.rectangle(canvas, (x1, y1), (x2, y2), (90, 90, 90), 1)
+    text_size, _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+    tx = x1 + max(4, (x2 - x1 - text_size[0]) // 2)
+    ty = y1 + (y2 - y1 + text_size[1]) // 2
+    cv2.putText(canvas, text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.45, text_color, 1)
+
+
+def _draw_slider(
+    canvas: np.ndarray,
+    rect: Tuple[int, int, int, int],
+    value: float,
+    min_val: float,
+    max_val: float,
+    label: str,
+    value_text: str,
+) -> None:
+    x1, y1, x2, y2 = rect
+    _draw_label(canvas, label, x1, y1 - 6)
+    cv2.rectangle(canvas, (x1, y1), (x2, y2), (50, 50, 50), -1)
+    cv2.rectangle(canvas, (x1, y1), (x2, y2), (90, 90, 90), 1)
+    if max_val > min_val:
+        ratio = (value - min_val) / float(max_val - min_val)
+    else:
+        ratio = 0.0
+    ratio = max(0.0, min(1.0, ratio))
+    knob_x = x1 + int(ratio * (x2 - x1))
+    knob_y = (y1 + y2) // 2
+    cv2.circle(canvas, (knob_x, knob_y), 6, (190, 190, 190), -1)
+    cv2.putText(canvas, value_text, (x2 + 8, y2 + 1), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1)
 
 
 def add_footer(canvas: np.ndarray, current_res: int) -> None:
-    """Draw footer with resolution selector hint."""
-    footer_y1 = canvas.shape[0] - 240
-    footer_y2 = canvas.shape[0] - 210
-    footer_y3 = canvas.shape[0] - 180
-    footer_y4 = canvas.shape[0] - 150
-    footer_y5 = canvas.shape[0] - 120
-    footer_y6 = canvas.shape[0] - 90
-    footer_y7 = canvas.shape[0] - 60
-    footer_y8 = canvas.shape[0] - 30
-    res_opts = " | ".join(f"{i+1}:{r}" for i, r in enumerate(RES_OPTIONS))
-    model_opts = " | ".join(f"{chr(k)}:{v[0]}" for k, v in MODEL_OPTIONS.items())
-    cv2.putText(canvas, f"RES -> {res_opts} ", (10, footer_y1),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
-    current_model_label = MODEL_OPTIONS.get(CURRENT_MODEL_KEY, ("", ""))[1]
-    cv2.putText(canvas, f"MODEL -> {model_opts} ", (10, footer_y2),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
-    cv2.putText(canvas, f"PEOPLE -> +/- (limit={CURRENT_PEOPLE_LIMIT})", (10, footer_y3),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
-    src_opts = ["c:camara"]
-    if VIDEO_FILES:
-        src_opts.append("v:video")
-    if ENABLE_NDI:
-        src_opts.append("n:ndi")
-    source_hint = "SRC -> " + " | ".join(src_opts)
-    cv2.putText(canvas, source_hint, (10, footer_y4),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
-    blur_hint = f"BLUR -> o / p (ksize={BLUR_KERNEL_OPTIONS[BLUR_KERNEL_IDX]}) | b: {'ON' if BLUR_ENABLED else 'OFF'}"
-    cv2.putText(canvas, blur_hint, (10, footer_y5),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
-    thresh_hint = f"THRESH -> j/k (val={MASK_THRESH})"
-    cv2.putText(canvas, thresh_hint, (10, footer_y6),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
-    imgsz_hint = f"IMG_SZ -> , / . (imgsz={IMG_SIZE_OPTIONS[IMG_SIZE_IDX]})"
-    cv2.putText(canvas, imgsz_hint, (10, footer_y7),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
-    hi_hint = (
-        f"HIGH PREC -> h ({'ON' if HIGH_PRECISION_MODE else 'OFF'}) | MASK VIEW -> m (soft/detail)"
-        f" | FLIP IN -> f ({'ON' if FLIP_INPUT else 'OFF'})"
+    """Draw footer GUI with mouse-interactive controls."""
+    global UI_HITBOXES
+    UI_HITBOXES = []
+    footer_h = 320
+    footer_top = canvas.shape[0] - footer_h
+    cv2.rectangle(canvas, (0, footer_top), (canvas.shape[1], canvas.shape[0]), UI_BG_COLOR, -1)
+
+    row1_y = footer_top + 12 + FOOTER_UI_OFFSET_Y
+    row2_y = footer_top + 70 + FOOTER_UI_OFFSET_Y
+    row3_y = footer_top + 130 + FOOTER_UI_OFFSET_Y
+    row4_y = footer_top + 190 + FOOTER_UI_OFFSET_Y
+    btn_h = 24
+    gap = 8
+    x = UI_MARGIN_LEFT
+    max_w = canvas.shape[1] - UI_MARGIN_LEFT
+
+    def _wrap_if_needed(next_w: int) -> None:
+        nonlocal x, row1_y
+        if x + next_w > max_w:
+            row1_y += 30
+            x = UI_MARGIN_LEFT
+
+    # RES buttons
+    _draw_label(canvas, "RES (1-5)", x, row1_y - 6)
+    for idx, res in enumerate(RES_OPTIONS):
+        rect = (x, row1_y, x + 52, row1_y + btn_h)
+        _draw_button(canvas, rect, f"{idx+1}:{res}", current_res == res, True)
+        UI_HITBOXES.append({"type": "button", "id": "res", "rect": rect, "value": idx, "enabled": True})
+        x += 52 + gap
+    x += 12
+
+    # MODEL buttons
+    _wrap_if_needed(230)
+    _draw_label(canvas, "MODEL (a/s/d)", x, row1_y - 6)
+    model_items = [(ord("a"), "a:n"), (ord("s"), "s:s"), (ord("d"), "d:m")]
+    for key, label in model_items:
+        rect = (x, row1_y, x + 56, row1_y + btn_h)
+        _draw_button(canvas, rect, label, CURRENT_MODEL_KEY == key, True)
+        UI_HITBOXES.append({"type": "button", "id": "model", "rect": rect, "value": key, "enabled": True})
+        x += 56 + gap
+    x += 12
+
+    # SOURCE buttons
+    _wrap_if_needed(220)
+    _draw_label(canvas, "SRC (c/v/n)", x, row1_y - 6)
+    source_items = [
+        ("camera", "c:cam", True),
+        ("video", "v:vid", bool(VIDEO_FILES)),
+        ("ndi", "n:ndi", bool(ENABLE_NDI)),
+    ]
+    for src, label, enabled in source_items:
+        rect = (x, row1_y, x + 60, row1_y + btn_h)
+        _draw_button(canvas, rect, label, CURRENT_SOURCE == src, enabled)
+        UI_HITBOXES.append({"type": "button", "id": "source", "rect": rect, "value": src, "enabled": enabled})
+        x += 60 + gap
+
+    # Toggle buttons row (use remaining width)
+    x += 8
+    _wrap_if_needed(320)
+    blur_rect = (x, row1_y, x + 72, row1_y + btn_h)
+    _draw_button(canvas, blur_rect, "b:blur", BLUR_ENABLED, True)
+    UI_HITBOXES.append({"type": "toggle", "id": "blur_enabled", "rect": blur_rect, "enabled": True})
+    x += 72 + gap + 8
+
+    hi_rect = (x, row1_y, x + 90, row1_y + btn_h)
+    _draw_button(canvas, hi_rect, "h:hi", HIGH_PRECISION_MODE, True)
+    UI_HITBOXES.append({"type": "toggle", "id": "high_prec", "rect": hi_rect, "enabled": True})
+    x += 90 + gap + 12
+
+    _draw_label(canvas, "MASK (m)", x, row1_y - 6)
+    soft_rect = (x, row1_y, x + 70, row1_y + btn_h)
+    _draw_button(canvas, soft_rect, "soft", not SHOW_DETAIL, True)
+    UI_HITBOXES.append({"type": "button", "id": "mask_view", "rect": soft_rect, "value": "soft", "enabled": True})
+    x += 70 + gap
+    detail_rect = (x, row1_y, x + 70, row1_y + btn_h)
+    _draw_button(canvas, detail_rect, "detail", SHOW_DETAIL, True)
+    UI_HITBOXES.append({"type": "button", "id": "mask_view", "rect": detail_rect, "value": "detail", "enabled": True})
+    x += 70 + gap + 12
+
+    flip_rect = (x, row1_y, x + 90, row1_y + btn_h)
+    _draw_button(canvas, flip_rect, "f:flip", FLIP_INPUT, True)
+    UI_HITBOXES.append({"type": "toggle", "id": "flip", "rect": flip_rect, "enabled": True})
+
+    # Row 2: PEOPLE slider + BLUR kernel
+    x = UI_MARGIN_LEFT
+    people_rect = (x, row2_y + 10, x + 320, row2_y + 22)
+    _draw_slider(
+        canvas,
+        people_rect,
+        CURRENT_PEOPLE_LIMIT,
+        PEOPLE_LIMIT_OPTIONS[0],
+        PEOPLE_LIMIT_OPTIONS[-1],
+        "PEOPLE (+/-)",
+        str(CURRENT_PEOPLE_LIMIT),
     )
-    cv2.putText(canvas, hi_hint, (10, footer_y8),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+    UI_HITBOXES.append({"type": "slider", "id": "people", "rect": people_rect})
+    x += 320 + 80
+
+    kernel_rect = (x, row2_y + 10, x + 260, row2_y + 22)
+    _draw_slider(
+        canvas,
+        kernel_rect,
+        BLUR_KERNEL_IDX,
+        0,
+        len(BLUR_KERNEL_OPTIONS) - 1,
+        "KERN (o/p)",
+        str(BLUR_KERNEL_OPTIONS[BLUR_KERNEL_IDX]),
+    )
+    UI_HITBOXES.append({"type": "slider_steps", "id": "blur_kernel", "rect": kernel_rect, "steps": BLUR_KERNEL_OPTIONS})
+
+    # Row 3: THRESH + IMG SIZE
+    x = UI_MARGIN_LEFT
+    thresh_rect = (x, row3_y + 10, x + 420, row3_y + 22)
+    _draw_slider(canvas, thresh_rect, MASK_THRESH, 0, 255, "THRESH (j/k)", str(MASK_THRESH))
+    UI_HITBOXES.append({"type": "slider", "id": "mask_thresh", "rect": thresh_rect})
+    x += 420 + 80
+
+    imgsz_rect = (x, row3_y + 10, x + 260, row3_y + 22)
+    _draw_slider(
+        canvas,
+        imgsz_rect,
+        IMG_SIZE_IDX,
+        0,
+        len(IMG_SIZE_OPTIONS) - 1,
+        "IMG (,/.)",
+        str(IMG_SIZE_OPTIONS[IMG_SIZE_IDX]),
+    )
+    UI_HITBOXES.append({"type": "slider_steps", "id": "img_size", "rect": imgsz_rect, "steps": IMG_SIZE_OPTIONS})
+
+    # Row 4: persistence sliders
+    x = UI_MARGIN_LEFT
+    hold_rect = (x, row4_y + 10, x + 320, row4_y + 22)
+    _draw_slider(
+        canvas,
+        hold_rect,
+        PERSIST_HOLD_SEC,
+        0.1,
+        1.0,
+        "PERSIST HOLD",
+        f"{PERSIST_HOLD_SEC:.2f}s",
+    )
+    UI_HITBOXES.append({"type": "slider", "id": "persist_hold", "rect": hold_rect})
+    x += 320 + 80
+
+    rise_rect = (x, row4_y + 10, x + 260, row4_y + 22)
+    _draw_slider(
+        canvas,
+        rise_rect,
+        PERSIST_RISE_TAU,
+        0.05,
+        0.5,
+        "PERSIST RISE",
+        f"{PERSIST_RISE_TAU:.2f}s",
+    )
+    UI_HITBOXES.append({"type": "slider", "id": "persist_rise", "rect": rise_rect})
+    x += 260 + 60
+
+    fall_rect = (x, row4_y + 10, x + 260, row4_y + 22)
+    _draw_slider(
+        canvas,
+        fall_rect,
+        PERSIST_FALL_TAU,
+        0.1,
+        0.8,
+        "PERSIST FALL",
+        f"{PERSIST_FALL_TAU:.2f}s",
+    )
+    UI_HITBOXES.append({"type": "slider", "id": "persist_fall", "rect": fall_rect})
+
+
+def _point_in_rect(x: int, y: int, rect: Tuple[int, int, int, int]) -> bool:
+    x1, y1, x2, y2 = rect
+    return x1 <= x <= x2 and y1 <= y <= y2
+
+
+def _apply_button_action(item: dict) -> None:
+    global UI_PENDING_MODEL_KEY, UI_PENDING_SOURCE, SHOW_DETAIL, FLIP_INPUT, HIGH_PRECISION_MODE
+    global BLUR_ENABLED
+    item_id = item["id"]
+    if item_id == "res":
+        set_resolution_by_index(int(item["value"]))
+        save_settings()
+        return
+    if item_id == "model":
+        UI_PENDING_MODEL_KEY = item["value"]
+        return
+    if item_id == "source":
+        UI_PENDING_SOURCE = item["value"]
+        return
+    if item_id == "mask_view":
+        SHOW_DETAIL = item["value"] == "detail"
+        save_settings()
+        return
+    if item_id == "flip":
+        FLIP_INPUT = not FLIP_INPUT
+        save_settings()
+        return
+    if item_id == "high_prec":
+        HIGH_PRECISION_MODE = not HIGH_PRECISION_MODE
+        save_settings()
+        return
+    if item_id == "blur_enabled":
+        BLUR_ENABLED = not BLUR_ENABLED
+        save_settings()
+        return
+
+
+def _apply_slider_action(item: dict, x: int) -> None:
+    global CURRENT_PEOPLE_LIMIT, BLUR_KERNEL_IDX, MASK_THRESH, IMG_SIZE_IDX
+    x1, _, x2, _ = item["rect"]
+    if x2 <= x1:
+        return
+    ratio = (x - x1) / float(x2 - x1)
+    ratio = max(0.0, min(1.0, ratio))
+    item_id = item["id"]
+
+    if item["type"] == "slider_steps":
+        steps = item["steps"]
+        idx = int(round(ratio * (len(steps) - 1))) if steps else 0
+        idx = max(0, min(idx, len(steps) - 1))
+        if item_id == "blur_kernel" and idx != BLUR_KERNEL_IDX:
+            BLUR_KERNEL_IDX = idx
+            save_settings()
+        elif item_id == "img_size" and idx != IMG_SIZE_IDX:
+            IMG_SIZE_IDX = idx
+            save_settings()
+        return
+
+    if item_id == "people":
+        min_val, max_val = PEOPLE_LIMIT_OPTIONS[0], PEOPLE_LIMIT_OPTIONS[-1]
+        val = int(round(min_val + ratio * (max_val - min_val)))
+        val = max(min_val, min(max_val, val))
+        if val != CURRENT_PEOPLE_LIMIT:
+            CURRENT_PEOPLE_LIMIT = val
+            save_settings()
+        return
+    if item_id == "mask_thresh":
+        val = int(round(ratio * 255))
+        val = max(0, min(255, val))
+        if val != MASK_THRESH:
+            MASK_THRESH = val
+            save_settings()
+        return
+    if item_id == "persist_hold":
+        min_val, max_val = 0.1, 1.0
+        val = min_val + ratio * (max_val - min_val)
+        if abs(val - PERSIST_HOLD_SEC) > 1e-3:
+            globals()["PERSIST_HOLD_SEC"] = val
+        return
+    if item_id == "persist_rise":
+        min_val, max_val = 0.05, 0.5
+        val = min_val + ratio * (max_val - min_val)
+        if abs(val - PERSIST_RISE_TAU) > 1e-3:
+            globals()["PERSIST_RISE_TAU"] = val
+        return
+    if item_id == "persist_fall":
+        min_val, max_val = 0.1, 0.8
+        val = min_val + ratio * (max_val - min_val)
+        if abs(val - PERSIST_FALL_TAU) > 1e-3:
+            globals()["PERSIST_FALL_TAU"] = val
+        return
+
+
+def on_mouse(event: int, x: int, y: int, flags: int, param: Any) -> None:
+    global UI_ACTIVE_SLIDER
+    if event == cv2.EVENT_LBUTTONDOWN:
+        for item in VIEW_HITBOXES + UI_HITBOXES:
+            if not item.get("enabled", True):
+                continue
+            if _point_in_rect(x, y, item["rect"]):
+                if item.get("type") == "view_tab":
+                    globals()["ACTIVE_VIEW_TAB"] = item["value"]
+                    return
+                if item["type"] in {"slider", "slider_steps"}:
+                    UI_ACTIVE_SLIDER = item
+                    _apply_slider_action(item, x)
+                else:
+                    _apply_button_action(item)
+                return
+    if event == cv2.EVENT_MOUSEMOVE and UI_ACTIVE_SLIDER is not None:
+        if flags & cv2.EVENT_FLAG_LBUTTON:
+            _apply_slider_action(UI_ACTIVE_SLIDER, x)
+        return
+    if event == cv2.EVENT_LBUTTONUP:
+        UI_ACTIVE_SLIDER = None
 
 
 def set_resolution_by_index(idx: int):
@@ -373,6 +760,48 @@ def release_capture(cap):
             cap.release()
         except Exception:
             pass
+
+
+def apply_model_change(model: YOLO, new_key: int) -> YOLO:
+    """Swap YOLO model if key differs; keeps current on failure."""
+    global CURRENT_MODEL_KEY, CURRENT_MODEL_PATH
+    if new_key not in MODEL_OPTIONS or new_key == CURRENT_MODEL_KEY:
+        return model
+    try:
+        new_model = load_model(MODEL_OPTIONS[new_key][0])
+        CURRENT_MODEL_KEY = new_key
+        CURRENT_MODEL_PATH = MODEL_OPTIONS[new_key][0]
+        save_current_model()
+        save_settings()
+        return new_model
+    except Exception as exc:
+        print(f"No se pudo cargar el modelo {MODEL_OPTIONS[new_key][0]}: {exc}", file=sys.stderr)
+        return model
+
+
+def apply_source_change(new_source: str, cap):
+    """Swap capture source; keeps previous on failure."""
+    global CURRENT_SOURCE, CURRENT_VIDEO_INDEX
+    if new_source == CURRENT_SOURCE:
+        return cap
+    if new_source == "video" and not VIDEO_FILES:
+        return cap
+    if new_source == "ndi" and not ENABLE_NDI:
+        return cap
+
+    prev_cap, prev_src = cap, CURRENT_SOURCE
+    CURRENT_SOURCE = new_source
+    if new_source == "video":
+        CURRENT_VIDEO_INDEX = 0
+    release_capture(cap)
+    cap = open_capture(CURRENT_SOURCE)
+    if not capture_ready(cap):
+        print(f"No se pudo abrir la fuente {new_source}, se mantiene la anterior.", file=sys.stderr)
+        CURRENT_SOURCE = prev_src
+        cap = prev_cap
+    else:
+        save_settings()
+    return cap
 
 
 # --------------- helpers NDI --------------------------------------
@@ -685,6 +1114,7 @@ def main():
     model_path = "yolov8n-seg.pt"
     global DEVICE, CURRENT_MODEL_PATH, CURRENT_MODEL_KEY, CURRENT_PEOPLE_LIMIT, CURRENT_SOURCE
     global BLUR_KERNEL_IDX, MASK_THRESH, BLUR_ENABLED, IMG_SIZE_IDX, HIGH_PRECISION_MODE, ENABLE_NDI, DEFAULT_SOURCE, SHOW_DETAIL, FLIP_INPUT
+    global UI_PENDING_MODEL_KEY, UI_PENDING_SOURCE, VIEW_HITBOXES
     load_saved_resolution()
     load_saved_model()
     load_settings()
@@ -733,20 +1163,31 @@ def main():
 
     prev_time = time.time()
     window_name = "NEXT2 VISION - ROTOR STUDIO"
-    canvas_size = (1280, 720)  # width, height
+    canvas_size = (CANVAS_WIDTH, CANVAS_HEIGHT)  # width, height (3 panels + gap)
     header_h = 40
-    footer_h = 260
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL | cv2.WINDOW_GUI_NORMAL)
-    cv2.resizeWindow(window_name, canvas_size[0], canvas_size[1])
+    footer_h = 320
+    cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE | cv2.WINDOW_GUI_NORMAL)
+    cv2.setMouseCallback(window_name, on_mouse)
     frame_idx = 0
     last_mask_soft = None
     last_mask_detail = None
     last_boxes = None
     last_frame = None
+    persist_mask = None
+    last_detect_time = None
+    last_detect_mask = None
     show_detail = SHOW_DETAIL
     ndi_pub = NDIPublisher("NEXT2 Mask NDI") if ENABLE_NDI and ENABLE_NDI_OUTPUT else None
 
     while True:
+        if UI_PENDING_MODEL_KEY is not None:
+            model = apply_model_change(model, UI_PENDING_MODEL_KEY)
+            UI_PENDING_MODEL_KEY = None
+        if UI_PENDING_SOURCE is not None:
+            cap = apply_source_change(UI_PENDING_SOURCE, cap)
+            UI_PENDING_SOURCE = None
+        show_detail = SHOW_DETAIL
+
         frame = capture_frame(cap)
         got_new_frame = frame is not None
         if frame is None:
@@ -789,27 +1230,54 @@ def main():
 
         boxed = draw_boxes(frame, boxes)
 
-        # FPS.
+        # FPS + persistencia.
         now = time.time()
         dt = now - prev_time
         prev_time = now
         fps = 1.0 / dt if dt > 0 else 0.0
+        persist_mask, last_detect_time, last_detect_mask = update_persistent_mask(
+            persist_mask, mask_detail, last_detect_time, last_detect_mask, now, max(dt, 1e-6)
+        )
+        persist_u8 = np.clip(persist_mask * 255.0, 0, 255).astype(np.uint8)
         print(f"FPS: {fps:0.2f}", end="\r", flush=True)
 
-        # Composición en ventana única: dos vistas lado a lado ocupando todo el ancho.
-        canvas = np.zeros((canvas_size[1], canvas_size[0], 3), dtype=np.uint8)
-        view_h = canvas_size[1] - header_h - footer_h
+        # Composición en ventana única: vista izquierda + panel tabbed a la derecha.
+        canvas = np.full((canvas_size[1], canvas_size[0], 3), UI_BG_COLOR, dtype=np.uint8)
+        view_h = canvas_size[1] - header_h - footer_h - FOOTER_GAP_PX - VIEW_OFFSET_Y
         half_w = canvas_size[0] // 2
+        view_y = header_h + VIEW_OFFSET_Y
+        VIEW_HITBOXES = []
 
         left_view = fit_to_box(boxed, (half_w, view_h))
         mask_to_show = mask_detail if show_detail else mask_soft
-        right_view = fit_to_box(cv2.cvtColor(mask_to_show, cv2.COLOR_GRAY2BGR), (half_w, view_h))
+        right_image = (
+            cv2.cvtColor(mask_to_show, cv2.COLOR_GRAY2BGR)
+            if ACTIVE_VIEW_TAB == "mask"
+            else cv2.cvtColor(persist_u8, cv2.COLOR_GRAY2BGR)
+        )
 
-        left_view = add_overlay(left_view, "Original + Boxes")
-        right_view = add_overlay(right_view, "Mask Detail" if show_detail else "Mask Soft")
+        left_view = make_labeled_view(left_view, "Original + Boxes", (half_w, view_h))
+        right_view, tab_rects = make_tabbed_view(
+            right_image, (half_w, view_h), (("mask", "Mask"), ("mod", "Suavizado")), ACTIVE_VIEW_TAB
+        )
 
-        canvas[header_h : header_h + left_view.shape[0], 0:half_w] = left_view
-        canvas[header_h : header_h + right_view.shape[0], half_w : half_w + right_view.shape[1]] = right_view
+        canvas[view_y : view_y + left_view.shape[0], 0:half_w] = left_view
+        canvas[view_y : view_y + right_view.shape[0], half_w : half_w + right_view.shape[1]] = right_view
+
+        for key, rect in tab_rects:
+            abs_rect = (
+                half_w + rect[0],
+                view_y + rect[1],
+                half_w + rect[2],
+                view_y + rect[3],
+            )
+            VIEW_HITBOXES.append({"type": "view_tab", "rect": abs_rect, "value": key, "enabled": True})
+
+        border_color = (200, 200, 200)
+        border_top = view_y + VIEW_LABEL_H
+        border_bottom = view_y + view_h - 1
+        cv2.rectangle(canvas, (0, border_top), (half_w - 1, border_bottom), border_color, 1)
+        cv2.rectangle(canvas, (half_w, border_top), (2 * half_w - 1, border_bottom), border_color, 1)
 
         res_text = f"{frame.shape[1]}x{frame.shape[0]}"
         people_count = len(boxes) if boxes is not None else 0
@@ -832,15 +1300,7 @@ def main():
             save_settings()
         # Cambio de modelo por teclas configuradas
         if key in MODEL_OPTIONS:
-            try:
-                new_model = load_model(MODEL_OPTIONS[key][0])
-                CURRENT_MODEL_KEY = key
-                CURRENT_MODEL_PATH = MODEL_OPTIONS[key][0]
-                save_current_model()
-                save_settings()
-                model = new_model
-            except Exception as exc:
-                print(f"No se pudo cargar el modelo {MODEL_OPTIONS[key][0]}: {exc}", file=sys.stderr)
+            model = apply_model_change(model, key)
         # Ajuste de límite de personas con +/- (teclado principal)
         if key == ord("+") or key == ord("="):
             CURRENT_PEOPLE_LIMIT = min(CURRENT_PEOPLE_LIMIT + 1, PEOPLE_LIMIT_OPTIONS[-1])
@@ -874,26 +1334,11 @@ def main():
             save_settings()
         # Cambio de fuente
         if key == ord("c"):
-            CURRENT_SOURCE = "camera"
-            release_capture(cap)
-            cap = open_capture(CURRENT_SOURCE)
-            save_settings()
+            cap = apply_source_change("camera", cap)
         if key == ord("v") and VIDEO_FILES:
-            CURRENT_SOURCE = "video"
-            CURRENT_VIDEO_INDEX = 0
-            release_capture(cap)
-            cap = open_capture(CURRENT_SOURCE)
-            save_settings()
+            cap = apply_source_change("video", cap)
         if key == ord("n") and ENABLE_NDI:
-            prev_cap, prev_src = cap, CURRENT_SOURCE
-            CURRENT_SOURCE = "ndi"
-            release_capture(cap)
-            cap = open_capture(CURRENT_SOURCE)
-            if not capture_ready(cap):
-                print("[NDI] No se pudo abrir fuente NDI, se mantiene la anterior.", file=sys.stderr)
-                CURRENT_SOURCE = prev_src
-                cap = prev_cap
-            save_settings()
+            cap = apply_source_change("ndi", cap)
         # Modo alta precisión (usa imgsz máximo y detalle sin blur)
         if key == ord("h"):
             HIGH_PRECISION_MODE = not HIGH_PRECISION_MODE
