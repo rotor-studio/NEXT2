@@ -522,13 +522,23 @@ def draw_boxes(frame: np.ndarray, boxes: np.ndarray) -> np.ndarray:
     return out
 
 
-def add_header(canvas: np.ndarray, fps: float, device: str, res_text: str, people_count: int, source_label: str) -> None:
+def add_header(
+    canvas: np.ndarray,
+    fps: float,
+    device: str,
+    res_text: str,
+    people_count: int,
+    source_label: str,
+    cap_fps: float | None = None,
+) -> None:
     """Draw a single header line with source, resolution, FPS, device, model and people count at the top of the canvas."""
     current_model_label = MODEL_OPTIONS.get(CURRENT_MODEL_KEY, (CURRENT_MODEL_PATH, CURRENT_MODEL_PATH))[1]
     fps_str = f"{fps:06.1f}"  # ancho fijo para evitar saltos en el texto
+    cap_fps_text = f"{cap_fps:0.1f}" if cap_fps is not None and cap_fps > 0 else "n/a"
     text = (
-        f"SRC: {source_label} | RES: {res_text} | MAXH: {CURRENT_MAX_HEIGHT} | FPS: {fps_str} | GPU: {device} | "
-        f"MODEL: {current_model_label} | PEOPLE NOW: {people_count} | PREC: {'HIGH' if HIGH_PRECISION_MODE else 'NORM'}"
+        f"SRC: {source_label} | RES: {res_text} | MAXH: {CURRENT_MAX_HEIGHT} | FPS: {fps_str} | "
+        f"CAP_FPS: {cap_fps_text} | GPU: {device} | MODEL: {current_model_label} | "
+        f"PEOPLE NOW: {people_count} | PREC: {'HIGH' if HIGH_PRECISION_MODE else 'NORM'}"
     )
     cv2.putText(canvas, text, (UI_MARGIN_LEFT, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
 
@@ -1561,6 +1571,7 @@ def main():
     canvas_size = (CANVAS_WIDTH, CANVAS_HEIGHT)  # width, height (3 panels + gap)
     header_h = 40
     footer_h = 380
+    cv2.setUseOptimized(True)
     cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE | cv2.WINDOW_GUI_NORMAL)
     cv2.setMouseCallback(window_name, on_mouse)
     frame_idx = 0
@@ -1591,6 +1602,7 @@ def main():
 
     last_result_seq = 0
     while True:
+        frame_start = time.perf_counter()
         if UI_PENDING_MODEL_KEY is not None:
             model = apply_model_change(model, UI_PENDING_MODEL_KEY, load=not USE_INFERENCE_THREAD)
             if infer_worker is not None:
@@ -1601,7 +1613,9 @@ def main():
             UI_PENDING_SOURCE = None
         show_detail = SHOW_DETAIL
 
+        t0 = time.perf_counter()
         frame = capture_frame(cap)
+        cap_ms = (time.perf_counter() - t0) * 1000.0
         got_new_frame = frame is not None
         if frame is None:
             if CURRENT_SOURCE == "video" and cap is not None:
@@ -1698,7 +1712,15 @@ def main():
             persist_mask, mask_detail, last_detect_time, last_detect_mask, now, max(dt, 1e-6)
         )
         persist_u8 = np.clip(persist_mask * 255.0, 0, 255).astype(np.uint8)
-        print(f"FPS: {fps:0.2f}", end="\r", flush=True)
+        if frame_idx % 10 == 0:
+            print(f"FPS: {fps:0.2f}", end="\r", flush=True)
+        if frame_idx % 30 == 0:
+            frame_ms = (time.perf_counter() - frame_start) * 1000.0
+            print(
+                f"FRAME_MS: {frame_ms:0.2f} | CAP_MS: {cap_ms:0.2f} | WAIT_MS: {wait_ms:0.2f}",
+                end="\r",
+                flush=True,
+            )
 
         # Composición en ventana única: tres vistas (izquierda + panel tabbed + derecha).
         canvas = np.full((canvas_size[1], canvas_size[0], 3), UI_BG_COLOR, dtype=np.uint8)
@@ -1765,12 +1787,6 @@ def main():
             cached_left_labeled_key = left_labeled_key
         else:
             left_view = cached_left_labeled
-        middle_view, tab_rects = make_tabbed_view(
-            middle_image,
-            (third_w, view_h),
-            (("mask", "Mask"), ("mod", "Suavizado")),
-            ACTIVE_VIEW_TAB,
-        )
         right_view = make_labeled_view(right_image, "Traslaciones", (third_w, right_view_h))
 
         ROI_PANEL_BOUNDS = (roi_w, roi_h)
@@ -1863,7 +1879,10 @@ def main():
 
         res_text = f"{frame.shape[1]}x{frame.shape[0]}"
         people_count = len(boxes) if boxes is not None else 0
-        add_header(canvas, fps, DEVICE, res_text, people_count, source_label())
+        cap_fps = None
+        if isinstance(cap, cv2.VideoCapture):
+            cap_fps = cap.get(cv2.CAP_PROP_FPS)
+        add_header(canvas, fps, DEVICE, res_text, people_count, source_label(), cap_fps=cap_fps)
 
         footer_top = canvas.shape[0] - footer_h
         left_footer_w = third_w * 2
@@ -1923,7 +1942,15 @@ def main():
 
         cv2.imshow(window_name, canvas)
 
-        key = cv2.waitKey(1) & 0xFF
+        key = 0
+        wait_ms = 0.0
+        if frame_idx % 2 == 0:
+            t_wait = time.perf_counter()
+            if hasattr(cv2, "pollKey"):
+                key = cv2.pollKey() & 0xFF
+            else:
+                key = cv2.waitKey(1) & 0xFF
+            wait_ms = (time.perf_counter() - t_wait) * 1000.0
         if key == ord("q"):
             break
         # Resolución por teclas 1-5
