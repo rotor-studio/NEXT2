@@ -9,7 +9,6 @@ from __future__ import annotations
 import sys
 import time
 import math
-import random
 from typing import Tuple, Any, Optional
 import os
 import multiprocessing as mp
@@ -48,7 +47,9 @@ def env_flag(name: str, default: bool = True) -> bool:
 
 
 ENABLE_NDI = env_flag("NEXT_ENABLE_NDI", True)  # Permite desactivar NDI si está inestable
+ENABLE_NDI_INPUT = env_flag("NEXT_ENABLE_NDI_INPUT", True)
 ENABLE_NDI_OUTPUT = env_flag("NEXT_ENABLE_NDI_OUTPUT", True)  # Publicar máscara por NDI
+ENABLE_NDI_TRANSLATIONS_OUTPUT = env_flag("NEXT_ENABLE_NDI_TRANSLATIONS_OUTPUT", False)
 DATA_DIR = Path(__file__).with_name("DATA")
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv"}
 VIDEO_FILES = sorted([p for p in DATA_DIR.glob("*") if p.suffix.lower() in VIDEO_EXTS])
@@ -81,6 +82,7 @@ ROI_DRAG_OFFSET = (0, 0)
 ROI_PANEL_BOUNDS = None  # (w, h) for right panel image area (local)
 ROI_PANEL_BOUNDS_ABS = None  # (x0, y0, w, h) absolute for mouse
 ROI_MAX = 3
+ROI_STATE = []  # per-ROI assignment state (centroids/persistence)
 
 # UI state (footer GUI)
 UI_HITBOXES = []
@@ -199,12 +201,16 @@ def segment_people(
     # Light closing to reduce jaggies without over-rounding.
     mask_soft = cv2.morphologyEx(mask_soft, cv2.MORPH_CLOSE, morph_kernel, iterations=1)
 
-    person_masks_u8 = []
+    person_masks_soft = []
     for m in person_masks:
         m_u8 = np.clip(m * 255.0, 0, 255).astype(np.uint8)
         _, m_u8 = cv2.threshold(m_u8, mask_thresh, 255, cv2.THRESH_BINARY)
-        person_masks_u8.append(m_u8)
-    return mask_soft, mask_detail, np.array(person_boxes), person_masks_u8
+        if ksize > 1:
+            m_u8 = cv2.GaussianBlur(m_u8, (ksize, ksize), 0)
+            _, m_u8 = cv2.threshold(m_u8, mask_thresh, 255, cv2.THRESH_BINARY)
+        m_u8 = cv2.morphologyEx(m_u8, cv2.MORPH_CLOSE, morph_kernel, iterations=1)
+        person_masks_soft.append(m_u8)
+    return mask_soft, mask_detail, np.array(person_boxes), person_masks_soft
 
 
 # --------------- composición y overlays ----------------------------
@@ -320,25 +326,82 @@ def add_roi() -> None:
     ROI_LIST.append(roi)
 
 
-def translate_masks_to_rois(masks: list, roi_list: list, roi_size: Tuple[int, int]) -> np.ndarray:
-    """Place each mask into a random ROI (inside its bounds) and return a composite view."""
+def translate_masks_to_rois(
+    masks: list, roi_list: list, roi_size: Tuple[int, int], now: float, dt: float
+) -> np.ndarray:
+    """Place each mask into a ROI (one per ROI) with stable assignment and fade."""
     w, h = roi_size
     out = np.zeros((h, w), dtype=np.uint8)
     if not masks or not roi_list:
         return out
+
+    global ROI_STATE
+    if len(ROI_STATE) != len(roi_list):
+        ROI_STATE = [
+            {"centroid": None, "persist_mask": None, "last_detect_time": None, "last_detect_mask": None}
+            for _ in roi_list
+        ]
+
+    mask_info = []
     for m in masks:
         if m is None or not np.any(m):
             continue
         ys, xs = np.where(m > 0)
         if ys.size == 0 or xs.size == 0:
             continue
+        cx = int(xs.mean())
+        cy = int(ys.mean())
+        mask_info.append((m, (cx, cy)))
+    if not mask_info:
+        return out
+
+    mask_info.sort(key=lambda item: item[1][0])
+    unused = set(range(len(mask_info)))
+    assign = [None] * len(roi_list)
+    dist_thresh = max(30, min(w, h) // 10)
+
+    for i, state in enumerate(ROI_STATE):
+        if state["centroid"] is None:
+            continue
+        best = None
+        best_d = None
+        for idx in list(unused):
+            _, (cx, cy) = mask_info[idx]
+            pcx, pcy = state["centroid"]
+            d = (cx - pcx) ** 2 + (cy - pcy) ** 2
+            if best_d is None or d < best_d:
+                best_d = d
+                best = idx
+        if best is not None and best_d is not None and best_d <= dist_thresh * dist_thresh:
+            assign[i] = best
+            unused.remove(best)
+
+    for i in range(len(roi_list)):
+        if assign[i] is None and unused:
+            assign[i] = min(unused)
+            unused.remove(assign[i])
+
+    for roi_idx, mask_idx in enumerate(assign):
+        if mask_idx is None:
+            empty = np.zeros((h, w), dtype=np.uint8)
+            state = ROI_STATE[roi_idx]
+            persist_mask, last_time, last_mask = update_persistent_mask(
+                state["persist_mask"], empty, state["last_detect_time"], state["last_detect_mask"], now, dt
+            )
+            state["persist_mask"] = persist_mask
+            state["last_detect_time"] = last_time
+            state["last_detect_mask"] = last_mask
+            out = np.maximum(out, np.clip(persist_mask * 255.0, 0, 255).astype(np.uint8))
+            continue
+        m, centroid = mask_info[mask_idx]
+        ys, xs = np.where(m > 0)
         x1, x2 = xs.min(), xs.max()
         y1, y2 = ys.min(), ys.max()
         crop = m[y1 : y2 + 1, x1 : x2 + 1]
         ch, cw = crop.shape[:2]
         if ch < 2 or cw < 2:
             continue
-        roi = random.choice(roi_list)
+        roi = roi_list[roi_idx]
         half = int(roi["half"])
         roi_w = half * 2
         roi_h = half * 2
@@ -348,21 +411,34 @@ def translate_masks_to_rois(masks: list, roi_list: list, roi_size: Tuple[int, in
             new_h = max(2, int(ch * scale))
             crop = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_AREA)
             ch, cw = crop.shape[:2]
-        max_x = max(0, roi_w - cw)
-        max_y = max(0, roi_h - ch)
-        off_x = random.randint(0, max_x) if max_x > 0 else 0
-        off_y = random.randint(0, max_y) if max_y > 0 else 0
-        dest_x1 = roi["cx"] - half + off_x
-        dest_y1 = roi["cy"] - half + off_y
+
+        state = ROI_STATE[roi_idx]
+        state["centroid"] = centroid
+
+        dest_x1 = roi["cx"] - (cw // 2)
+        dest_y1 = roi["cy"] - (ch // 2)
+        roi_x1 = roi["cx"] - half
+        roi_y1 = roi["cy"] - half
+        roi_x2 = roi["cx"] + half
+        roi_y2 = roi["cy"] + half
+        dest_x1 = max(roi_x1, min(roi_x2 - cw, dest_x1))
+        dest_y1 = max(roi_y1, min(roi_y2 - ch, dest_y1))
         dest_x2 = min(dest_x1 + cw, w)
         dest_y2 = min(dest_y1 + ch, h)
         src_w = dest_x2 - dest_x1
         src_h = dest_y2 - dest_y1
         if src_w <= 0 or src_h <= 0:
             continue
-        out[dest_y1:dest_y2, dest_x1:dest_x2] = np.maximum(
-            out[dest_y1:dest_y2, dest_x1:dest_x2], crop[:src_h, :src_w]
+
+        placed = np.zeros((h, w), dtype=np.uint8)
+        placed[dest_y1:dest_y2, dest_x1:dest_x2] = crop[:src_h, :src_w]
+        persist_mask, last_time, last_mask = update_persistent_mask(
+            state["persist_mask"], placed, state["last_detect_time"], state["last_detect_mask"], now, dt
         )
+        state["persist_mask"] = persist_mask
+        state["last_detect_time"] = last_time
+        state["last_detect_mask"] = last_mask
+        out = np.maximum(out, np.clip(persist_mask * 255.0, 0, 255).astype(np.uint8))
     return out
 
 
@@ -515,7 +591,7 @@ def add_footer(canvas: np.ndarray, current_res: int) -> None:
     source_items = [
         ("camera", "c:cam", True),
         ("video", "v:vid", bool(VIDEO_FILES)),
-        ("ndi", "n:ndi", bool(ENABLE_NDI)),
+        ("ndi", "n:ndi", bool(ENABLE_NDI and ENABLE_NDI_INPUT)),
     ]
     for src, label, enabled in source_items:
         rect = (x, row1_y, x + 60, row1_y + btn_h)
@@ -567,6 +643,8 @@ def add_footer(canvas: np.ndarray, current_res: int) -> None:
     roi_reset_rect = (x, row1_y, x + 90, row1_y + btn_h)
     _draw_button(canvas, roi_reset_rect, "ROI reset", False, roi_reset_enabled)
     UI_HITBOXES.append({"type": "button", "id": "roi_reset", "rect": roi_reset_rect, "enabled": roi_reset_enabled})
+
+    # NDI toggles moved to per-view bottom-left corners.
 
     # Row 2: PEOPLE slider + BLUR kernel
     x = UI_MARGIN_LEFT
@@ -662,7 +740,8 @@ def _point_in_rect(x: int, y: int, rect: Tuple[int, int, int, int]) -> bool:
 
 def _apply_button_action(item: dict) -> None:
     global UI_PENDING_MODEL_KEY, UI_PENDING_SOURCE, SHOW_DETAIL, FLIP_INPUT, HIGH_PRECISION_MODE
-    global BLUR_ENABLED, ROI_LIST
+    global BLUR_ENABLED, ROI_LIST, ROI_STATE
+    global ENABLE_NDI_INPUT, ENABLE_NDI_OUTPUT, ENABLE_NDI_TRANSLATIONS_OUTPUT, CURRENT_SOURCE
     item_id = item["id"]
     if item_id == "res":
         set_resolution_by_index(int(item["value"]))
@@ -696,9 +775,25 @@ def _apply_button_action(item: dict) -> None:
     if item_id == "roi_remove":
         if ROI_LIST:
             ROI_LIST.pop()
+            ROI_STATE = ROI_STATE[: len(ROI_LIST)]
         return
     if item_id == "roi_reset":
         ROI_LIST.clear()
+        ROI_STATE.clear()
+        return
+    if item_id == "ndi_input":
+        ENABLE_NDI_INPUT = not ENABLE_NDI_INPUT
+        if not ENABLE_NDI_INPUT and CURRENT_SOURCE == "ndi":
+            UI_PENDING_SOURCE = "camera"
+        save_settings()
+        return
+    if item_id == "ndi_output":
+        ENABLE_NDI_OUTPUT = not ENABLE_NDI_OUTPUT
+        save_settings()
+        return
+    if item_id == "ndi_trans_output":
+        ENABLE_NDI_TRANSLATIONS_OUTPUT = not ENABLE_NDI_TRANSLATIONS_OUTPUT
+        save_settings()
         return
 
 
@@ -963,7 +1058,7 @@ def apply_source_change(new_source: str, cap):
         return cap
     if new_source == "video" and not VIDEO_FILES:
         return cap
-    if new_source == "ndi" and not ENABLE_NDI:
+    if new_source == "ndi" and (not ENABLE_NDI or not ENABLE_NDI_INPUT):
         return cap
 
     prev_cap, prev_src = cap, CURRENT_SOURCE
@@ -1041,6 +1136,7 @@ def _clamp(val: int, low: int, high: int) -> int:
 def load_settings():
     global CURRENT_PEOPLE_LIMIT, BLUR_KERNEL_IDX, BLUR_ENABLED, MASK_THRESH
     global IMG_SIZE_IDX, HIGH_PRECISION_MODE, NDI_OUTPUT_MASK, CURRENT_SOURCE, SHOW_DETAIL, FLIP_INPUT
+    global ENABLE_NDI_INPUT, ENABLE_NDI_OUTPUT, ENABLE_NDI_TRANSLATIONS_OUTPUT
     try:
         import json
 
@@ -1077,6 +1173,20 @@ def load_settings():
     except Exception:
         pass
     try:
+        ENABLE_NDI_INPUT = bool(data.get("ndi_input_enabled", ENABLE_NDI_INPUT))
+    except Exception:
+        pass
+    try:
+        ENABLE_NDI_OUTPUT = bool(data.get("ndi_output_enabled", ENABLE_NDI_OUTPUT))
+    except Exception:
+        pass
+    try:
+        ENABLE_NDI_TRANSLATIONS_OUTPUT = bool(
+            data.get("ndi_translations_output_enabled", ENABLE_NDI_TRANSLATIONS_OUTPUT)
+        )
+    except Exception:
+        pass
+    try:
         src = str(data.get("source", CURRENT_SOURCE)).lower()
         if src in {"camera", "video", "ndi"}:
             CURRENT_SOURCE = src
@@ -1101,6 +1211,9 @@ def save_settings(extra: dict[str, Any] | None = None):
         "img_size_idx": IMG_SIZE_IDX,
         "high_precision_mode": HIGH_PRECISION_MODE,
         "ndi_output_mask": NDI_OUTPUT_MASK,
+        "ndi_input_enabled": ENABLE_NDI_INPUT,
+        "ndi_output_enabled": ENABLE_NDI_OUTPUT,
+        "ndi_translations_output_enabled": ENABLE_NDI_TRANSLATIONS_OUTPUT,
         "source": CURRENT_SOURCE,
         "show_detail": SHOW_DETAIL,
         "flip_input": FLIP_INPUT,
@@ -1291,6 +1404,7 @@ def main():
     model_path = "yolov8n-seg.pt"
     global DEVICE, CURRENT_MODEL_PATH, CURRENT_MODEL_KEY, CURRENT_PEOPLE_LIMIT, CURRENT_SOURCE
     global BLUR_KERNEL_IDX, MASK_THRESH, BLUR_ENABLED, IMG_SIZE_IDX, HIGH_PRECISION_MODE, ENABLE_NDI, DEFAULT_SOURCE, SHOW_DETAIL, FLIP_INPUT
+    global ENABLE_NDI_INPUT, ENABLE_NDI_OUTPUT, ENABLE_NDI_TRANSLATIONS_OUTPUT
     global UI_PENDING_MODEL_KEY, UI_PENDING_SOURCE, VIEW_HITBOXES, ROI_PANEL_BOUNDS, ROI_PANEL_BOUNDS_ABS
     load_saved_resolution()
     load_saved_model()
@@ -1316,6 +1430,9 @@ def main():
         if not ndi_ok:
             print("[NDI] No se pudo inicializar NDIlib (se desactiva).", file=sys.stderr)
             ENABLE_NDI = False
+            ENABLE_NDI_INPUT = False
+            ENABLE_NDI_OUTPUT = False
+            ENABLE_NDI_TRANSLATIONS_OUTPUT = False
 
     # Decide fuente por env o por disponibilidad (por defecto cámara; NDI se selecciona a mano).
     if env_source in {"ndi", "camera", "video"}:
@@ -1323,7 +1440,7 @@ def main():
     else:
         CURRENT_SOURCE = "camera"
 
-    if CURRENT_SOURCE == "ndi" and not ENABLE_NDI:
+    if CURRENT_SOURCE == "ndi" and (not ENABLE_NDI or not ENABLE_NDI_INPUT):
         print("[NDI] Fuente NDI solicitada pero NDI no está disponible, usando cámara.", file=sys.stderr)
         CURRENT_SOURCE = "camera"
 
@@ -1356,6 +1473,9 @@ def main():
     last_detect_mask = None
     show_detail = SHOW_DETAIL
     ndi_pub = NDIPublisher("NEXT2 Mask NDI") if ENABLE_NDI and ENABLE_NDI_OUTPUT else None
+    ndi_trans_pub = (
+        NDIPublisher("NEXT2 Translations NDI") if ENABLE_NDI and ENABLE_NDI_TRANSLATIONS_OUTPUT else None
+    )
 
     while True:
         if UI_PENDING_MODEL_KEY is not None:
@@ -1445,7 +1565,9 @@ def main():
         )
         roi_w = third_w
         roi_h = max(1, view_h - VIEW_LABEL_H)
-        translated = translate_masks_to_rois(person_masks, ROI_LIST, (roi_w, roi_h))
+        translated = translate_masks_to_rois(
+            person_masks, ROI_LIST, (roi_w, roi_h), now, max(dt, 1e-6)
+        )
         right_image = cv2.cvtColor(translated, cv2.COLOR_GRAY2BGR)
 
         left_view = make_labeled_view(left_view, "Original + Boxes", (third_w, view_h))
@@ -1468,13 +1590,18 @@ def main():
         for roi in ROI_LIST:
             _clamp_roi(roi, rw, rh)
             x1, y1, x2, y2 = _roi_rect(roi)
-            cv2.rectangle(
-                right_view,
-                (x1, VIEW_LABEL_H + y1),
-                (x2, VIEW_LABEL_H + y2),
-                (255, 0, 0),
-                2,
-            )
+            x1 = max(0, min(rw - 1, x1))
+            y1 = max(0, min(rh - 1, y1))
+            x2 = max(0, min(rw - 1, x2))
+            y2 = max(0, min(rh - 1, y2))
+            if x2 > x1 and y2 > y1:
+                cv2.rectangle(
+                    right_view,
+                    (x1, VIEW_LABEL_H + y1),
+                    (x2, VIEW_LABEL_H + y2),
+                    (255, 0, 0),
+                    2,
+                )
 
         canvas[view_y : view_y + left_view.shape[0], 0:third_w] = left_view
         canvas[
@@ -1500,15 +1627,46 @@ def main():
         cv2.rectangle(canvas, (third_w, border_top), (2 * third_w - 1, border_bottom), border_color, 1)
         cv2.rectangle(canvas, (2 * third_w, border_top), (3 * third_w - 1, border_bottom), border_color, 1)
 
+        btn_h = 22
+        pad = 8
+        btn_w = 90
+        btn_y = view_y + view_h + 10
+
+        left_btn = (pad, btn_y, pad + btn_w, btn_y + btn_h)
+        _draw_button(canvas, left_btn, "NDI IN", ENABLE_NDI_INPUT, ENABLE_NDI)
+        VIEW_HITBOXES.append({"type": "toggle", "id": "ndi_input", "rect": left_btn, "enabled": ENABLE_NDI})
+
+        mid_x0 = third_w
+        mid_btn = (mid_x0 + pad, btn_y, mid_x0 + pad + 100, btn_y + btn_h)
+        _draw_button(canvas, mid_btn, "NDI OUT", ENABLE_NDI_OUTPUT, ENABLE_NDI)
+        VIEW_HITBOXES.append({"type": "toggle", "id": "ndi_output", "rect": mid_btn, "enabled": ENABLE_NDI})
+
+        right_x0 = 2 * third_w
+        right_btn = (right_x0 + pad, btn_y, right_x0 + pad + 110, btn_y + btn_h)
+        _draw_button(canvas, right_btn, "NDI TR", ENABLE_NDI_TRANSLATIONS_OUTPUT, ENABLE_NDI)
+        VIEW_HITBOXES.append(
+            {"type": "toggle", "id": "ndi_trans_output", "rect": right_btn, "enabled": ENABLE_NDI}
+        )
+
         res_text = f"{frame.shape[1]}x{frame.shape[0]}"
         people_count = len(boxes) if boxes is not None else 0
         add_header(canvas, fps, DEVICE, res_text, people_count, source_label())
         add_footer(canvas, CURRENT_MAX_HEIGHT)
 
         # Publicación NDI (máscara) - por defecto la suave; cambiar a mask_detail si se desea.
+        if ENABLE_NDI and ENABLE_NDI_OUTPUT and ndi_pub is None:
+            ndi_pub = NDIPublisher("NEXT2 Mask NDI")
+        if not ENABLE_NDI_OUTPUT:
+            ndi_pub = None
         if ndi_pub is not None:
             mask_out = mask_soft if NDI_OUTPUT_MASK == "soft" else mask_detail
             ndi_pub.publish(mask_out)
+        if ENABLE_NDI and ENABLE_NDI_TRANSLATIONS_OUTPUT and ndi_trans_pub is None:
+            ndi_trans_pub = NDIPublisher("NEXT2 Translations NDI")
+        if not ENABLE_NDI_TRANSLATIONS_OUTPUT:
+            ndi_trans_pub = None
+        if ndi_trans_pub is not None:
+            ndi_trans_pub.publish(translated)
 
         cv2.imshow(window_name, canvas)
 
@@ -1558,7 +1716,7 @@ def main():
             cap = apply_source_change("camera", cap)
         if key == ord("v") and VIDEO_FILES:
             cap = apply_source_change("video", cap)
-        if key == ord("n") and ENABLE_NDI:
+        if key == ord("n") and ENABLE_NDI and ENABLE_NDI_INPUT:
             cap = apply_source_change("ndi", cap)
         # Modo alta precisión (usa imgsz máximo y detalle sin blur)
         if key == ord("h"):
