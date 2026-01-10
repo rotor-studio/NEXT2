@@ -1,1 +1,1 @@
-yolov8n-seg.pt
+yolov8s-seg.pt
