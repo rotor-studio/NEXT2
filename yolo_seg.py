@@ -9,6 +9,7 @@ from __future__ import annotations
 import sys
 import time
 import math
+import random
 from typing import Tuple, Any, Optional
 import os
 import multiprocessing as mp
@@ -74,6 +75,12 @@ UI_BG_COLOR = (30, 30, 30)
 VIEW_BG_COLOR = (0, 0, 0)
 VIEW_HITBOXES = []
 ACTIVE_VIEW_TAB = "mask"
+ROI_LIST = []
+ROI_ACTIVE_IDX = None
+ROI_DRAG_OFFSET = (0, 0)
+ROI_PANEL_BOUNDS = None  # (w, h) for right panel image area (local)
+ROI_PANEL_BOUNDS_ABS = None  # (x0, y0, w, h) absolute for mouse
+ROI_MAX = 3
 
 # UI state (footer GUI)
 UI_HITBOXES = []
@@ -122,7 +129,9 @@ def capture_frame(cap: cv2.VideoCapture):
 
 
 # --------------- segmentación --------------------------------------
-def segment_people(frame: np.ndarray, model: YOLO, people_limit: int, mask_thresh: int, blur_enabled: bool) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def segment_people(
+    frame: np.ndarray, model: YOLO, people_limit: int, mask_thresh: int, blur_enabled: bool
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, list]:
     """
     Run YOLOv8 segmentation and return:
     - mask_soft: smoothed binary mask (uint8) suitable for NDI/output.
@@ -143,7 +152,7 @@ def segment_people(frame: np.ndarray, model: YOLO, people_limit: int, mask_thres
     # If the model returns no masks, bail early.
     if result.masks is None or result.boxes is None:
         empty = np.zeros((h, w), dtype=np.uint8)
-        return empty, empty, np.empty((0, 4))
+        return empty, empty, np.empty((0, 4)), []
 
     masks = result.masks.data.cpu().numpy()  # shape: (N, H, W) in model space
     classes = result.boxes.cls.cpu().numpy().astype(int)  # shape: (N,)
@@ -154,17 +163,19 @@ def segment_people(frame: np.ndarray, model: YOLO, people_limit: int, mask_thres
     person_indices = [i for i, cls_id in enumerate(classes) if cls_id == 0]
     if not person_indices:
         empty = np.zeros((h, w), dtype=np.uint8)
-        return empty, empty, np.empty((0, 4))
+        return empty, empty, np.empty((0, 4)), []
     person_indices = sorted(person_indices, key=lambda i: confs[i], reverse=True)[:people_limit]
 
     # Aggregate soft mask (float) to keep fine contours before thresholding.
     person_mask = np.zeros((h, w), dtype=np.float32)
+    person_masks = []
     person_boxes = []
     for idx in person_indices:
         m = masks[idx]
         # Resize mask from model space to frame space; keep float precision for later threshold.
         m_resized = cv2.resize(m, (w, h), interpolation=cv2.INTER_LINEAR)
         person_mask = np.maximum(person_mask, m_resized)
+        person_masks.append(m_resized)
         person_boxes.append(boxes_all[idx])
 
     # Convert to uint8 scale 0-255 for morphology/thresholding.
@@ -188,7 +199,12 @@ def segment_people(frame: np.ndarray, model: YOLO, people_limit: int, mask_thres
     # Light closing to reduce jaggies without over-rounding.
     mask_soft = cv2.morphologyEx(mask_soft, cv2.MORPH_CLOSE, morph_kernel, iterations=1)
 
-    return mask_soft, mask_detail, np.array(person_boxes)
+    person_masks_u8 = []
+    for m in person_masks:
+        m_u8 = np.clip(m * 255.0, 0, 255).astype(np.uint8)
+        _, m_u8 = cv2.threshold(m_u8, mask_thresh, 255, cv2.THRESH_BINARY)
+        person_masks_u8.append(m_u8)
+    return mask_soft, mask_detail, np.array(person_boxes), person_masks_u8
 
 
 # --------------- composición y overlays ----------------------------
@@ -271,6 +287,83 @@ def make_tabbed_view(
         fitted = fit_to_box(image, (box_w, box_h - label_h))
         view[label_h : label_h + fitted.shape[0], 0 : fitted.shape[1]] = fitted
     return view, tab_rects
+
+
+def _roi_rect(roi: dict) -> Tuple[int, int, int, int]:
+    half = int(roi["half"])
+    cx = int(roi["cx"])
+    cy = int(roi["cy"])
+    return cx - half, cy - half, cx + half, cy + half
+
+
+def _clamp_roi(roi: dict, w: int, h: int) -> None:
+    half = max(20, int(roi["half"]))
+    max_half = max(20, min(w, h) // 2)
+    half = min(half, max_half)
+    cx = int(roi["cx"])
+    cy = int(roi["cy"])
+    cx = max(half, min(w - half, cx))
+    cy = max(half, min(h - half, cy))
+    roi["half"] = half
+    roi["cx"] = cx
+    roi["cy"] = cy
+
+
+def add_roi() -> None:
+    global ROI_LIST
+    if ROI_PANEL_BOUNDS is None or len(ROI_LIST) >= ROI_MAX:
+        return
+    w, h = ROI_PANEL_BOUNDS
+    half = max(20, min(w, h) // 6)
+    roi = {"cx": w // 2, "cy": h // 2, "half": half}
+    _clamp_roi(roi, w, h)
+    ROI_LIST.append(roi)
+
+
+def translate_masks_to_rois(masks: list, roi_list: list, roi_size: Tuple[int, int]) -> np.ndarray:
+    """Place each mask into a random ROI (inside its bounds) and return a composite view."""
+    w, h = roi_size
+    out = np.zeros((h, w), dtype=np.uint8)
+    if not masks or not roi_list:
+        return out
+    for m in masks:
+        if m is None or not np.any(m):
+            continue
+        ys, xs = np.where(m > 0)
+        if ys.size == 0 or xs.size == 0:
+            continue
+        x1, x2 = xs.min(), xs.max()
+        y1, y2 = ys.min(), ys.max()
+        crop = m[y1 : y2 + 1, x1 : x2 + 1]
+        ch, cw = crop.shape[:2]
+        if ch < 2 or cw < 2:
+            continue
+        roi = random.choice(roi_list)
+        half = int(roi["half"])
+        roi_w = half * 2
+        roi_h = half * 2
+        scale = min(roi_w / float(cw), roi_h / float(ch), 1.0)
+        if scale < 1.0:
+            new_w = max(2, int(cw * scale))
+            new_h = max(2, int(ch * scale))
+            crop = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            ch, cw = crop.shape[:2]
+        max_x = max(0, roi_w - cw)
+        max_y = max(0, roi_h - ch)
+        off_x = random.randint(0, max_x) if max_x > 0 else 0
+        off_y = random.randint(0, max_y) if max_y > 0 else 0
+        dest_x1 = roi["cx"] - half + off_x
+        dest_y1 = roi["cy"] - half + off_y
+        dest_x2 = min(dest_x1 + cw, w)
+        dest_y2 = min(dest_y1 + ch, h)
+        src_w = dest_x2 - dest_x1
+        src_h = dest_y2 - dest_y1
+        if src_w <= 0 or src_h <= 0:
+            continue
+        out[dest_y1:dest_y2, dest_x1:dest_x2] = np.maximum(
+            out[dest_y1:dest_y2, dest_x1:dest_x2], crop[:src_h, :src_w]
+        )
+    return out
 
 
 def update_persistent_mask(
@@ -456,6 +549,24 @@ def add_footer(canvas: np.ndarray, current_res: int) -> None:
     flip_rect = (x, row1_y, x + 90, row1_y + btn_h)
     _draw_button(canvas, flip_rect, "f:flip", FLIP_INPUT, True)
     UI_HITBOXES.append({"type": "toggle", "id": "flip", "rect": flip_rect, "enabled": True})
+    x += 90 + gap + 12
+
+    roi_enabled = len(ROI_LIST) < ROI_MAX
+    roi_rect = (x, row1_y, x + 90, row1_y + btn_h)
+    _draw_button(canvas, roi_rect, "ROI +", False, roi_enabled)
+    UI_HITBOXES.append({"type": "button", "id": "roi_add", "rect": roi_rect, "enabled": roi_enabled})
+    x += 90 + gap
+
+    roi_minus_enabled = len(ROI_LIST) > 0
+    roi_minus_rect = (x, row1_y, x + 70, row1_y + btn_h)
+    _draw_button(canvas, roi_minus_rect, "ROI -", False, roi_minus_enabled)
+    UI_HITBOXES.append({"type": "button", "id": "roi_remove", "rect": roi_minus_rect, "enabled": roi_minus_enabled})
+    x += 70 + gap
+
+    roi_reset_enabled = len(ROI_LIST) > 0
+    roi_reset_rect = (x, row1_y, x + 90, row1_y + btn_h)
+    _draw_button(canvas, roi_reset_rect, "ROI reset", False, roi_reset_enabled)
+    UI_HITBOXES.append({"type": "button", "id": "roi_reset", "rect": roi_reset_rect, "enabled": roi_reset_enabled})
 
     # Row 2: PEOPLE slider + BLUR kernel
     x = UI_MARGIN_LEFT
@@ -551,7 +662,7 @@ def _point_in_rect(x: int, y: int, rect: Tuple[int, int, int, int]) -> bool:
 
 def _apply_button_action(item: dict) -> None:
     global UI_PENDING_MODEL_KEY, UI_PENDING_SOURCE, SHOW_DETAIL, FLIP_INPUT, HIGH_PRECISION_MODE
-    global BLUR_ENABLED
+    global BLUR_ENABLED, ROI_LIST
     item_id = item["id"]
     if item_id == "res":
         set_resolution_by_index(int(item["value"]))
@@ -578,6 +689,16 @@ def _apply_button_action(item: dict) -> None:
     if item_id == "blur_enabled":
         BLUR_ENABLED = not BLUR_ENABLED
         save_settings()
+        return
+    if item_id == "roi_add":
+        add_roi()
+        return
+    if item_id == "roi_remove":
+        if ROI_LIST:
+            ROI_LIST.pop()
+        return
+    if item_id == "roi_reset":
+        ROI_LIST.clear()
         return
 
 
@@ -638,8 +759,22 @@ def _apply_slider_action(item: dict, x: int) -> None:
 
 
 def on_mouse(event: int, x: int, y: int, flags: int, param: Any) -> None:
-    global UI_ACTIVE_SLIDER
+    global UI_ACTIVE_SLIDER, ROI_ACTIVE_IDX, ROI_DRAG_OFFSET
+
     if event == cv2.EVENT_LBUTTONDOWN:
+        if ROI_PANEL_BOUNDS_ABS is not None:
+            bx, by, bw, bh = ROI_PANEL_BOUNDS_ABS
+            if bx <= x <= bx + bw and by <= y <= by + bh:
+                local_x = x - bx
+                local_y = y - by
+                for idx, roi in enumerate(reversed(ROI_LIST)):
+                    real_idx = len(ROI_LIST) - 1 - idx
+                    rx1, ry1, rx2, ry2 = _roi_rect(roi)
+                    if rx1 <= local_x <= rx2 and ry1 <= local_y <= ry2:
+                        ROI_ACTIVE_IDX = real_idx
+                        ROI_DRAG_OFFSET = (roi["cx"] - local_x, roi["cy"] - local_y)
+                        return
+
         for item in VIEW_HITBOXES + UI_HITBOXES:
             if not item.get("enabled", True):
                 continue
@@ -653,12 +788,54 @@ def on_mouse(event: int, x: int, y: int, flags: int, param: Any) -> None:
                 else:
                     _apply_button_action(item)
                 return
-    if event == cv2.EVENT_MOUSEMOVE and UI_ACTIVE_SLIDER is not None:
-        if flags & cv2.EVENT_FLAG_LBUTTON:
+
+    if event == cv2.EVENT_MOUSEMOVE:
+        if ROI_ACTIVE_IDX is not None and ROI_PANEL_BOUNDS_ABS is not None and flags & cv2.EVENT_FLAG_LBUTTON:
+            bx, by, bw, bh = ROI_PANEL_BOUNDS_ABS
+            local_x = x - bx
+            local_y = y - by
+            dx, dy = ROI_DRAG_OFFSET
+            roi = ROI_LIST[ROI_ACTIVE_IDX]
+            roi["cx"] = int(local_x + dx)
+            roi["cy"] = int(local_y + dy)
+            _clamp_roi(roi, bw, bh)
+            return
+        if UI_ACTIVE_SLIDER is not None and flags & cv2.EVENT_FLAG_LBUTTON:
             _apply_slider_action(UI_ACTIVE_SLIDER, x)
+            return
+
+    if event == cv2.EVENT_MOUSEWHEEL:
+        if ROI_PANEL_BOUNDS_ABS is None:
+            return
+        bx, by, bw, bh = ROI_PANEL_BOUNDS_ABS
+        if not (bx <= x <= bx + bw and by <= y <= by + bh):
+            return
+        delta = (flags >> 16) & 0xFFFF
+        if delta & 0x8000:
+            delta = delta - 0x10000
+        if delta == 0:
+            return
+        local_x = x - bx
+        local_y = y - by
+        target_idx = None
+        for idx in range(len(ROI_LIST) - 1, -1, -1):
+            rx1, ry1, rx2, ry2 = _roi_rect(ROI_LIST[idx])
+            if rx1 <= local_x <= rx2 and ry1 <= local_y <= ry2:
+                target_idx = idx
+                break
+        if target_idx is None and ROI_ACTIVE_IDX is not None:
+            target_idx = ROI_ACTIVE_IDX
+        if target_idx is None:
+            return
+        roi = ROI_LIST[target_idx]
+        step = 6 if delta > 0 else -6
+        roi["half"] = int(roi["half"]) + step
+        _clamp_roi(roi, bw, bh)
         return
+
     if event == cv2.EVENT_LBUTTONUP:
         UI_ACTIVE_SLIDER = None
+        ROI_ACTIVE_IDX = None
 
 
 def set_resolution_by_index(idx: int):
@@ -1114,7 +1291,7 @@ def main():
     model_path = "yolov8n-seg.pt"
     global DEVICE, CURRENT_MODEL_PATH, CURRENT_MODEL_KEY, CURRENT_PEOPLE_LIMIT, CURRENT_SOURCE
     global BLUR_KERNEL_IDX, MASK_THRESH, BLUR_ENABLED, IMG_SIZE_IDX, HIGH_PRECISION_MODE, ENABLE_NDI, DEFAULT_SOURCE, SHOW_DETAIL, FLIP_INPUT
-    global UI_PENDING_MODEL_KEY, UI_PENDING_SOURCE, VIEW_HITBOXES
+    global UI_PENDING_MODEL_KEY, UI_PENDING_SOURCE, VIEW_HITBOXES, ROI_PANEL_BOUNDS, ROI_PANEL_BOUNDS_ABS
     load_saved_resolution()
     load_saved_model()
     load_settings()
@@ -1172,6 +1349,7 @@ def main():
     last_mask_soft = None
     last_mask_detail = None
     last_boxes = None
+    last_person_masks = []
     last_frame = None
     persist_mask = None
     last_detect_time = None
@@ -1210,13 +1388,23 @@ def main():
 
         do_process = (frame_idx % PROCESS_EVERY_N == 0 or last_mask_soft is None) and got_new_frame
         if do_process:
-            mask_soft, mask_detail, boxes = segment_people(
+            mask_soft, mask_detail, boxes, person_masks = segment_people(
                 frame, model, CURRENT_PEOPLE_LIMIT, MASK_THRESH, BLUR_ENABLED
             )
-            last_mask_soft, last_mask_detail, last_boxes = mask_soft, mask_detail, boxes
+            last_mask_soft, last_mask_detail, last_boxes, last_person_masks = (
+                mask_soft,
+                mask_detail,
+                boxes,
+                person_masks,
+            )
             last_frame = frame
         else:
-            mask_soft, mask_detail, boxes = last_mask_soft, last_mask_detail, last_boxes
+            mask_soft, mask_detail, boxes, person_masks = (
+                last_mask_soft,
+                last_mask_detail,
+                last_boxes,
+                last_person_masks,
+            )
         frame_idx += 1
 
         # Fallback en caso de no tener máscaras aún (evita crash en cvtColor).
@@ -1255,7 +1443,10 @@ def main():
             if ACTIVE_VIEW_TAB == "mask"
             else cv2.cvtColor(persist_u8, cv2.COLOR_GRAY2BGR)
         )
-        right_image = np.zeros((view_h, third_w, 3), dtype=np.uint8)
+        roi_w = third_w
+        roi_h = max(1, view_h - VIEW_LABEL_H)
+        translated = translate_masks_to_rois(person_masks, ROI_LIST, (roi_w, roi_h))
+        right_image = cv2.cvtColor(translated, cv2.COLOR_GRAY2BGR)
 
         left_view = make_labeled_view(left_view, "Original + Boxes", (third_w, view_h))
         middle_view, tab_rects = make_tabbed_view(
@@ -1265,6 +1456,25 @@ def main():
             ACTIVE_VIEW_TAB,
         )
         right_view = make_labeled_view(right_image, "Traslaciones", (third_w, view_h))
+
+        ROI_PANEL_BOUNDS = (roi_w, roi_h)
+        ROI_PANEL_BOUNDS_ABS = (
+            2 * third_w,
+            view_y + VIEW_LABEL_H,
+            roi_w,
+            roi_h,
+        )
+        rx0, ry0, rw, rh = ROI_PANEL_BOUNDS_ABS
+        for roi in ROI_LIST:
+            _clamp_roi(roi, rw, rh)
+            x1, y1, x2, y2 = _roi_rect(roi)
+            cv2.rectangle(
+                right_view,
+                (x1, VIEW_LABEL_H + y1),
+                (x2, VIEW_LABEL_H + y2),
+                (255, 0, 0),
+                2,
+            )
 
         canvas[view_y : view_y + left_view.shape[0], 0:third_w] = left_view
         canvas[
