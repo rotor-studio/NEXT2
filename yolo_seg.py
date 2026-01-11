@@ -540,7 +540,15 @@ def add_header(
         f"CAP_FPS: {cap_fps_text} | GPU: {device} | MODEL: {current_model_label} | "
         f"PEOPLE NOW: {people_count} | PREC: {'HIGH' if HIGH_PRECISION_MODE else 'NORM'}"
     )
-    cv2.putText(canvas, text, (UI_MARGIN_LEFT, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+    font_scale = 0.5
+    max_w = canvas.shape[1] - UI_MARGIN_LEFT - 10
+    render_text = text
+    while True:
+        size, _ = cv2.getTextSize(render_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)
+        if size[0] <= max_w or len(render_text) <= 8:
+            break
+        render_text = render_text[:-4] + "..."
+    cv2.putText(canvas, render_text, (UI_MARGIN_LEFT, 25), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 1)
 
 
 def _draw_label(canvas: np.ndarray, text: str, x: int, y: int) -> None:
