@@ -10,6 +10,6 @@
   "ndi_output_enabled": false,
   "ndi_translations_output_enabled": true,
   "source": "video",
-  "show_detail": false,
+  "show_detail": true,
   "flip_input": true
 }
