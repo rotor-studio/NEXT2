@@ -1265,7 +1265,8 @@ def save_settings(extra: dict[str, Any] | None = None):
 
 class InferenceWorker:
     def __init__(self, model_path: str):
-        self.model_path = model_path
+        self.desired_model_path = model_path
+        self.loaded_model_path = model_path
         self.model = load_model(model_path)
         self.frame_lock = threading.Lock()
         self.result_lock = threading.Lock()
@@ -1284,7 +1285,7 @@ class InferenceWorker:
 
     def set_model_path(self, model_path: str) -> None:
         with self.frame_lock:
-            self.model_path = model_path
+            self.desired_model_path = model_path
         self.event.set()
 
     def get_latest(self) -> Tuple[Any, int]:
@@ -1296,11 +1297,11 @@ class InferenceWorker:
         self.event.set()
         self.thread.join(timeout=1.0)
 
-    def _maybe_reload(self, path: str) -> None:
-        if path == self.model_path:
+    def _maybe_reload(self) -> None:
+        if self.desired_model_path == self.loaded_model_path:
             return
-        self.model_path = path
-        self.model = load_model(path)
+        self.model = load_model(self.desired_model_path)
+        self.loaded_model_path = self.desired_model_path
 
     def _loop(self) -> None:
         while not self.stop_event.is_set():
@@ -1310,13 +1311,12 @@ class InferenceWorker:
             with self.frame_lock:
                 req = self.pending
                 self.pending = None
-                current_model_path = self.model_path
             self.event.clear()
             if req is None:
+                self._maybe_reload()
                 continue
+            self._maybe_reload()
             frame, settings = req
-            if current_model_path != self.model_path:
-                self._maybe_reload(current_model_path)
             masks = segment_people(
                 frame,
                 self.model,
@@ -1548,6 +1548,7 @@ def main():
         CURRENT_SOURCE = "camera"
 
     infer_worker = None
+    model = None
     if USE_INFERENCE_THREAD:
         try:
             infer_worker = InferenceWorker(CURRENT_MODEL_PATH)
