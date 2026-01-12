@@ -51,11 +51,19 @@ ENABLE_NDI = env_flag("NEXT_ENABLE_NDI", True)  # Permite desactivar NDI si est�
 ENABLE_NDI_INPUT = env_flag("NEXT_ENABLE_NDI_INPUT", True)
 ENABLE_NDI_OUTPUT = env_flag("NEXT_ENABLE_NDI_OUTPUT", True)  # Publicar máscara por NDI
 ENABLE_NDI_TRANSLATIONS_OUTPUT = env_flag("NEXT_ENABLE_NDI_TRANSLATIONS_OUTPUT", False)
+ENABLE_RTSP_INPUT = env_flag("NEXT_ENABLE_RTSP_INPUT", True)
+RTSP_URL = os.environ.get(
+    "NEXT_RTSP_URL",
+    "rtsp://192.168.0.215:5543/c9fa2e29ba99618fc28088ccae18076b/live/channel0",
+).strip()
+RTSP_TRANSPORT = os.environ.get("NEXT_RTSP_TRANSPORT", "udp").strip().lower()
+RTSP_RECONNECT_SEC = float(os.environ.get("NEXT_RTSP_RECONNECT_SEC", "2.0"))
+USE_RTSP_THREAD = False
 DATA_DIR = Path(__file__).with_name("DATA")
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv"}
 VIDEO_FILES = sorted([p for p in DATA_DIR.glob("*") if p.suffix.lower() in VIDEO_EXTS])
 DEFAULT_SOURCE = "camera"  # se ajusta en runtime tras probar NDI
-CURRENT_SOURCE = DEFAULT_SOURCE  # "camera", "video" o "ndi"
+CURRENT_SOURCE = DEFAULT_SOURCE  # "camera", "video", "ndi" o "rtsp"
 CURRENT_VIDEO_INDEX = 0
 NDI_PREFERRED_SOURCE = "MadMapper"
 BLUR_KERNEL_OPTIONS = [1, 3, 5, 7, 9, 11, 13]
@@ -125,22 +133,30 @@ def maybe_flip_input(frame: np.ndarray) -> np.ndarray:
 
 
 def capture_frame(cap: cv2.VideoCapture):
-    """Capture and resize a frame; returns None if capture fails."""
+    """Capture and resize a frame; returns (frame, is_new)."""
+    if cap is None:
+        return None, False
+    if hasattr(cap, "read_latest"):
+        frame, is_new = cap.read_latest()
+        if frame is None:
+            return None, False
+        frame = resize_keep_aspect(frame, max_height=CURRENT_MAX_HEIGHT)
+        return maybe_flip_input(frame), is_new
     if isinstance(cap, NDIReceiver):
         frame = cap.capture()
         if frame is None:
-            return None
+            return None, False
         # Para NDI, limitamos a la resolución de entrada seleccionada (altura) y al imgsz actual.
         target_h = min(CURRENT_MAX_HEIGHT, IMG_SIZE_OPTIONS[IMG_SIZE_IDX])
         if HIGH_PRECISION_MODE:
             target_h = max(target_h, IMG_SIZE_OPTIONS[-1])
         frame = resize_keep_aspect(frame, max_height=target_h)
-        return maybe_flip_input(frame)
+        return maybe_flip_input(frame), True
     ok, frame = cap.read()
     if not ok:
-        return None
+        return None, False
     frame = resize_keep_aspect(frame, max_height=CURRENT_MAX_HEIGHT)
-    return maybe_flip_input(frame)
+    return maybe_flip_input(frame), True
 
 
 # --------------- segmentación --------------------------------------
@@ -647,6 +663,7 @@ def add_footer(canvas: np.ndarray, current_res: int, footer_h: int | None = None
         ("camera", "c:cam", True),
         ("video", "v:vid", bool(VIDEO_FILES)),
         ("ndi", "n:ndi", bool(ENABLE_NDI and ENABLE_NDI_INPUT)),
+        ("rtsp", "r:rtsp", bool(ENABLE_RTSP_INPUT and RTSP_URL)),
     ]
     for src, label, enabled in source_items:
         rect = (x, row1_y, x + 60, row1_y + btn_h)
@@ -681,6 +698,7 @@ def add_footer(canvas: np.ndarray, current_res: int, footer_h: int | None = None
     _draw_button(canvas, flip_rect, "f:flip", FLIP_INPUT, True)
     UI_HITBOXES.append({"type": "toggle", "id": "flip", "rect": flip_rect, "enabled": True})
     x += 90 + gap + 12
+
 
     # NDI toggles moved to per-view bottom-left corners.
 
@@ -782,6 +800,7 @@ def _apply_button_action(item: dict) -> None:
     global UI_PENDING_MODEL_KEY, UI_PENDING_SOURCE, SHOW_DETAIL, FLIP_INPUT, HIGH_PRECISION_MODE
     global BLUR_ENABLED, ROI_LIST, ROI_STATE, ROI_DIRTY
     global ENABLE_NDI_INPUT, ENABLE_NDI_OUTPUT, ENABLE_NDI_TRANSLATIONS_OUTPUT, CURRENT_SOURCE
+    global ENABLE_RTSP_INPUT, RTSP_URL
     item_id = item["id"]
     if item_id == "res":
         set_resolution_by_index(int(item["value"]))
@@ -836,6 +855,17 @@ def _apply_button_action(item: dict) -> None:
     if item_id == "ndi_trans_output":
         ENABLE_NDI_TRANSLATIONS_OUTPUT = not ENABLE_NDI_TRANSLATIONS_OUTPUT
         save_settings()
+        return
+    if item_id == "rtsp_input":
+        ENABLE_RTSP_INPUT = not ENABLE_RTSP_INPUT
+        if not ENABLE_RTSP_INPUT and CURRENT_SOURCE == "rtsp":
+            UI_PENDING_SOURCE = "camera"
+        save_settings()
+        return
+    if item_id == "rtsp_cfg":
+        load_rtsp_url_from_settings()
+        save_settings()
+        UI_PENDING_SOURCE = "rtsp"
         return
 
 
@@ -1026,6 +1056,20 @@ def load_model(path: str):
     return mdl
 
 
+def load_rtsp_url_from_settings() -> None:
+    """Reload RTSP_URL from settings.json if present."""
+    global RTSP_URL
+    try:
+        import json
+
+        data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+        url = str(data.get("rtsp_url", RTSP_URL)).strip()
+        if url:
+            RTSP_URL = url
+    except Exception:
+        pass
+
+
 def open_capture(source: str):
     """Open capture for camera, video file, or NDI."""
     global CURRENT_VIDEO_INDEX
@@ -1037,6 +1081,23 @@ def open_capture(source: str):
         return cap
     if source == "ndi":
         return NDIReceiver(source_name=NDI_PREFERRED_SOURCE)
+    if source == "rtsp":
+        if not RTSP_URL:
+            print("RTSP URL vacío.", file=sys.stderr)
+            return None
+        if "OPENCV_FFMPEG_CAPTURE_OPTIONS" not in os.environ:
+            transport = "tcp" if RTSP_TRANSPORT == "tcp" else "udp"
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+                f"rtsp_transport;{transport}|fflags;nobuffer|flags;low_delay"
+            )
+        cap = cv2.VideoCapture(RTSP_URL)
+        try:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
+        if USE_RTSP_THREAD:
+            return LatestFrameCapture(cap)
+        return cap
     if source == "video":
         if not VIDEO_FILES:
             print("No hay videos en DATA/", file=sys.stderr)
@@ -1053,6 +1114,8 @@ def source_label():
         return "Camera"
     if CURRENT_SOURCE == "ndi":
         return "NDI"
+    if CURRENT_SOURCE == "rtsp":
+        return "RTSP"
     if CURRENT_SOURCE == "video" and VIDEO_FILES:
         return f"Video: {VIDEO_FILES[CURRENT_VIDEO_INDEX].name}"
     return CURRENT_SOURCE
@@ -1063,6 +1126,11 @@ def capture_ready(cap):
         return False
     if isinstance(cap, NDIReceiver):
         return cap.ready
+    if hasattr(cap, "isOpened"):
+        try:
+            return cap.isOpened()
+        except Exception:
+            return False
     return cap.isOpened()
 
 
@@ -1102,6 +1170,8 @@ def apply_source_change(new_source: str, cap):
     if new_source == "video" and not VIDEO_FILES:
         return cap
     if new_source == "ndi" and (not ENABLE_NDI or not ENABLE_NDI_INPUT):
+        return cap
+    if new_source == "rtsp" and (not ENABLE_RTSP_INPUT or not RTSP_URL):
         return cap
 
     prev_cap, prev_src = cap, CURRENT_SOURCE
@@ -1179,7 +1249,7 @@ def _clamp(val: int, low: int, high: int) -> int:
 def load_settings():
     global CURRENT_PEOPLE_LIMIT, BLUR_KERNEL_IDX, BLUR_ENABLED, MASK_THRESH
     global IMG_SIZE_IDX, HIGH_PRECISION_MODE, NDI_OUTPUT_MASK, CURRENT_SOURCE, SHOW_DETAIL, FLIP_INPUT
-    global ENABLE_NDI_INPUT, ENABLE_NDI_OUTPUT, ENABLE_NDI_TRANSLATIONS_OUTPUT
+    global ENABLE_NDI_INPUT, ENABLE_NDI_OUTPUT, ENABLE_NDI_TRANSLATIONS_OUTPUT, ENABLE_RTSP_INPUT, RTSP_URL
     try:
         import json
 
@@ -1243,6 +1313,16 @@ def load_settings():
         FLIP_INPUT = bool(data.get("flip_input", FLIP_INPUT))
     except Exception:
         pass
+    try:
+        ENABLE_RTSP_INPUT = bool(data.get("rtsp_input_enabled", ENABLE_RTSP_INPUT))
+    except Exception:
+        pass
+    try:
+        url = str(data.get("rtsp_url", RTSP_URL)).strip()
+        if url:
+            RTSP_URL = url
+    except Exception:
+        pass
 
 
 def save_settings(extra: dict[str, Any] | None = None):
@@ -1257,6 +1337,8 @@ def save_settings(extra: dict[str, Any] | None = None):
         "ndi_input_enabled": ENABLE_NDI_INPUT,
         "ndi_output_enabled": ENABLE_NDI_OUTPUT,
         "ndi_translations_output_enabled": ENABLE_NDI_TRANSLATIONS_OUTPUT,
+        "rtsp_input_enabled": ENABLE_RTSP_INPUT,
+        "rtsp_url": RTSP_URL,
         "source": CURRENT_SOURCE,
         "show_detail": SHOW_DETAIL,
         "flip_input": FLIP_INPUT,
@@ -1336,6 +1418,48 @@ class InferenceWorker:
             with self.result_lock:
                 self.result = masks
                 self.result_seq += 1
+
+
+class LatestFrameCapture:
+    """Background reader that always exposes the latest frame (low-latency)."""
+
+    def __init__(self, cap: cv2.VideoCapture):
+        self.cap = cap
+        self.lock = threading.Lock()
+        self.frame = None
+        self.new = False
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+
+    def _loop(self) -> None:
+        while not self.stop_event.is_set():
+            ok, frame = self.cap.read()
+            if not ok:
+                time.sleep(0.005)
+                continue
+            with self.lock:
+                self.frame = frame
+                self.new = True
+
+    def read_latest(self):
+        with self.lock:
+            frame = self.frame
+            is_new = self.new
+            self.new = False
+        return frame, is_new
+
+    def isOpened(self):
+        return self.cap is not None and self.cap.isOpened()
+
+    def release(self):
+        self.stop_event.set()
+        self.thread.join(timeout=0.5)
+        if self.cap is not None:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
 
 
 # --------------- Syphon (opcional) ----------------------------------
@@ -1514,7 +1638,7 @@ def main():
     model_path = "yolov8n-seg.pt"
     global DEVICE, CURRENT_MODEL_PATH, CURRENT_MODEL_KEY, CURRENT_PEOPLE_LIMIT, CURRENT_SOURCE
     global BLUR_KERNEL_IDX, MASK_THRESH, BLUR_ENABLED, IMG_SIZE_IDX, HIGH_PRECISION_MODE, ENABLE_NDI, DEFAULT_SOURCE, SHOW_DETAIL, FLIP_INPUT
-    global ENABLE_NDI_INPUT, ENABLE_NDI_OUTPUT, ENABLE_NDI_TRANSLATIONS_OUTPUT
+    global ENABLE_NDI_INPUT, ENABLE_NDI_OUTPUT, ENABLE_NDI_TRANSLATIONS_OUTPUT, ENABLE_RTSP_INPUT
     global UI_PENDING_MODEL_KEY, UI_PENDING_SOURCE, VIEW_HITBOXES, ROI_PANEL_BOUNDS, ROI_PANEL_BOUNDS_ABS
     global FOOTER_CACHE, FOOTER_CACHE_KEY, FOOTER_CACHE_HITBOXES, UI_HITBOXES
     load_saved_resolution()
@@ -1546,13 +1670,16 @@ def main():
             ENABLE_NDI_TRANSLATIONS_OUTPUT = False
 
     # Decide fuente por env o por disponibilidad (por defecto cámara; NDI se selecciona a mano).
-    if env_source in {"ndi", "camera", "video"}:
+    if env_source in {"ndi", "camera", "video", "rtsp"}:
         CURRENT_SOURCE = env_source
     else:
         CURRENT_SOURCE = "camera"
 
     if CURRENT_SOURCE == "ndi" and (not ENABLE_NDI or not ENABLE_NDI_INPUT):
         print("[NDI] Fuente NDI solicitada pero NDI no está disponible, usando cámara.", file=sys.stderr)
+        CURRENT_SOURCE = "camera"
+    if CURRENT_SOURCE == "rtsp" and (not ENABLE_RTSP_INPUT or not RTSP_URL):
+        print("[RTSP] Fuente RTSP solicitada pero no está disponible, usando cámara.", file=sys.stderr)
         CURRENT_SOURCE = "camera"
 
     infer_worker = None
@@ -1590,6 +1717,7 @@ def main():
     last_boxed = None
     last_person_masks = []
     last_frame = None
+    last_rtsp_frame_time = time.time()
     last_mask_to_show = None
     cached_middle_view = None
     cached_middle_key = None
@@ -1623,16 +1751,14 @@ def main():
         show_detail = SHOW_DETAIL
 
         t0 = time.perf_counter()
-        frame = capture_frame(cap)
+        frame, got_new_frame = capture_frame(cap)
         cap_ms = (time.perf_counter() - t0) * 1000.0
-        got_new_frame = frame is not None
         if frame is None:
             if CURRENT_SOURCE == "video" and cap is not None:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                frame = capture_frame(cap)
-                got_new_frame = frame is not None
-            elif CURRENT_SOURCE == "ndi":
-                # Mantener último frame o negro mientras esperamos señal NDI.
+                frame, got_new_frame = capture_frame(cap)
+            elif CURRENT_SOURCE in {"ndi", "rtsp"}:
+                # Mantener último frame o negro mientras esperamos señal.
                 if last_frame is not None:
                     frame = last_frame.copy()
                 else:
@@ -1643,6 +1769,13 @@ def main():
             if frame is None:
                 print("Frame no capturado. Saliendo.", file=sys.stderr)
                 break
+        if CURRENT_SOURCE == "rtsp":
+            if got_new_frame:
+                last_rtsp_frame_time = time.time()
+            elif time.time() - last_rtsp_frame_time > RTSP_RECONNECT_SEC:
+                release_capture(cap)
+                cap = open_capture("rtsp")
+                last_rtsp_frame_time = time.time()
 
         do_process = (frame_idx % PROCESS_EVERY_N == 0 or last_mask_soft is None) and got_new_frame
         if do_process:
@@ -1879,6 +2012,12 @@ def main():
         left_btn = (pad, btn_y, pad + btn_w, btn_y + btn_h)
         _draw_button(canvas, left_btn, "NDI IN", ENABLE_NDI_INPUT, ENABLE_NDI)
         VIEW_HITBOXES.append({"type": "toggle", "id": "ndi_input", "rect": left_btn, "enabled": ENABLE_NDI})
+        rtsp_btn = (pad + btn_w + 8, btn_y, pad + btn_w + 8 + btn_w, btn_y + btn_h)
+        _draw_button(canvas, rtsp_btn, "RTSP IN", ENABLE_RTSP_INPUT, True)
+        VIEW_HITBOXES.append({"type": "toggle", "id": "rtsp_input", "rect": rtsp_btn, "enabled": True})
+        rtsp_cfg_btn = (pad + (btn_w + 8) * 2, btn_y, pad + (btn_w + 8) * 2 + btn_w, btn_y + btn_h)
+        _draw_button(canvas, rtsp_cfg_btn, "RTSP CFG", False, True)
+        VIEW_HITBOXES.append({"type": "button", "id": "rtsp_cfg", "rect": rtsp_cfg_btn, "enabled": True})
 
         mid_x0 = third_w
         mid_btn = (mid_x0 + pad, btn_y, mid_x0 + pad + 100, btn_y + btn_h)
@@ -2007,6 +2146,8 @@ def main():
             cap = apply_source_change("video", cap)
         if key == ord("n") and ENABLE_NDI and ENABLE_NDI_INPUT:
             cap = apply_source_change("ndi", cap)
+        if key == ord("r"):
+            cap = apply_source_change("rtsp", cap)
         # Modo alta precisión (usa imgsz máximo y detalle sin blur)
         if key == ord("h"):
             HIGH_PRECISION_MODE = not HIGH_PRECISION_MODE
