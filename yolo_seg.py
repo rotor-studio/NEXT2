@@ -1213,13 +1213,12 @@ def get_ndi_module():
 def _ndi_probe_worker(result_queue: mp.Queue):
     """Intento seguro de cargar NDIlib en un proceso aislado."""
     try:
-        import cyndilib as ndi  # type: ignore
-        finder = ndi.Finder()
-        finder.open()
-        finder.wait_for_sources(0.5)
-        # NDI salida no depende de fuentes detectadas; basta con inicializar runtime.
+        ndi = get_ndi_module()
+        if ndi is None:
+            result_queue.put(False)
+            return
+        # NDI salida no depende de fuentes detectadas; basta con cargar runtime.
         result_queue.put(True)
-        finder.close()
     except Exception:
         result_queue.put(False)
 
@@ -1663,11 +1662,8 @@ def main():
     if ENABLE_NDI:
         ndi_ok = probe_ndi_available()
         if not ndi_ok:
-            print("[NDI] No se pudo inicializar NDIlib (se desactiva).", file=sys.stderr)
-            ENABLE_NDI = False
-            ENABLE_NDI_INPUT = False
-            ENABLE_NDI_OUTPUT = False
-            ENABLE_NDI_TRANSLATIONS_OUTPUT = False
+            print("[NDI] No se pudo inicializar NDIlib.", file=sys.stderr)
+            # No forzamos el apagado global para permitir reactivar salida NDI manualmente.
 
     # Decide fuente por env o por disponibilidad (por defecto cámara; NDI se selecciona a mano).
     if env_source in {"ndi", "camera", "video", "rtsp"}:
