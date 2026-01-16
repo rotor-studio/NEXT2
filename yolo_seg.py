@@ -81,8 +81,12 @@ VIEW_LABEL_H = 24  # altura del label sobre cada vista
 VIEW_OFFSET_Y = 20  # baja las vistas (label + imagen) dentro del canvas
 CANVAS_WIDTH = 1536
 CANVAS_HEIGHT = 816  # extra altura para GUI inferior
+NDI_TR_OUTPUT_W = 1080
+NDI_TR_OUTPUT_H = 1920
 UI_BG_COLOR = (30, 30, 30)
 VIEW_BG_COLOR = (0, 0, 0)
+RIGHT_PANEL_BG_COLOR = (45, 45, 45)
+ROI_WORK_BG_COLOR = (0, 0, 0)
 RIGHT_PANEL_FOOTER_H = 70  # espacio bajo la tercera ventana para botones
 RIGHT_PANEL_MARGIN_X = 20
 RIGHT_PANEL_ROW_GAP = 10
@@ -1900,8 +1904,16 @@ def main():
                 (("mask", "Mask"), ("mod", "Suavizado")),
                 ACTIVE_VIEW_TAB,
             )
-        roi_w = third_w
-        roi_h = max(1, right_view_h - VIEW_LABEL_H)
+        roi_avail_w = third_w
+        roi_avail_h = max(1, right_view_h - VIEW_LABEL_H)
+        roi_scale = min(
+            roi_avail_w / float(NDI_TR_OUTPUT_W),
+            roi_avail_h / float(NDI_TR_OUTPUT_H),
+        )
+        roi_w = max(1, int(NDI_TR_OUTPUT_W * roi_scale))
+        roi_h = max(1, int(NDI_TR_OUTPUT_H * roi_scale))
+        roi_x_off = max(0, (third_w - roi_w) // 2)
+        roi_y_off = VIEW_LABEL_H  # align to top under label, like other views
         if cached_translated is None or ROI_DIRTY or do_process:
             translated = translate_masks_to_rois(
                 person_masks, ROI_LIST, (roi_w, roi_h), now, max(dt, 1e-6)
@@ -1910,7 +1922,7 @@ def main():
             ROI_DIRTY = False
         else:
             translated = cached_translated
-        right_key = (id(translated), third_w, right_view_h)
+        right_key = (id(translated), roi_w, roi_h)
         if cached_right_bgr is None or cached_right_key != right_key:
             right_image = cv2.cvtColor(translated, cv2.COLOR_GRAY2BGR)
             cached_right_bgr = right_image
@@ -1925,12 +1937,27 @@ def main():
             cached_left_labeled_key = left_labeled_key
         else:
             left_view = cached_left_labeled
-        right_view = make_labeled_view(right_image, "Traslaciones", (third_w, right_view_h))
+        right_view = np.full((right_view_h, third_w, 3), RIGHT_PANEL_BG_COLOR, dtype=np.uint8)
+        cv2.rectangle(right_view, (0, 0), (third_w - 1, VIEW_LABEL_H), UI_BG_COLOR, -1)
+        cv2.putText(
+            right_view,
+            "Traslaciones",
+            (UI_MARGIN_LEFT, VIEW_LABEL_H - 6),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (235, 235, 235),
+            1,
+        )
+        roi_view = np.full((roi_h, roi_w, 3), ROI_WORK_BG_COLOR, dtype=np.uint8)
+        if translated is not None:
+            mask = translated > 0
+            roi_view[mask] = right_image[mask]
+        right_view[roi_y_off : roi_y_off + roi_h, roi_x_off : roi_x_off + roi_w] = roi_view
 
         ROI_PANEL_BOUNDS = (roi_w, roi_h)
         ROI_PANEL_BOUNDS_ABS = (
-            2 * third_w,
-            view_y + VIEW_LABEL_H,
+            2 * third_w + roi_x_off,
+            view_y + roi_y_off,
             roi_w,
             roi_h,
         )
@@ -1946,8 +1973,8 @@ def main():
                 if x2 > x1 and y2 > y1:
                     cv2.rectangle(
                         right_view,
-                        (x1, VIEW_LABEL_H + y1),
-                        (x2, VIEW_LABEL_H + y2),
+                        (roi_x_off + x1, roi_y_off + y1),
+                        (roi_x_off + x2, roi_y_off + y2),
                         (255, 0, 0),
                         2,
                     )
@@ -2082,7 +2109,14 @@ def main():
         if not ENABLE_NDI_TRANSLATIONS_OUTPUT:
             ndi_trans_pub = None
         if ndi_trans_pub is not None:
-            ndi_trans_pub.publish(translated)
+            trans_out = translated
+            if trans_out.shape[:2] != (NDI_TR_OUTPUT_H, NDI_TR_OUTPUT_W):
+                trans_out = cv2.resize(
+                    trans_out,
+                    (NDI_TR_OUTPUT_W, NDI_TR_OUTPUT_H),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+            ndi_trans_pub.publish(trans_out)
 
         cv2.imshow(window_name, canvas)
 
