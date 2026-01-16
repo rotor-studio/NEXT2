@@ -110,6 +110,7 @@ ROI_DIRTY = False
 # OSC settings + UI state
 OSC_IP = "127.0.0.1"
 OSC_PORT = 9000
+OSC_ENABLED = False
 OSC_SEND_HZ = 20.0
 OSC_SEND_INTERVAL = 1.0 / OSC_SEND_HZ
 UI_ACTIVE_TEXT = None
@@ -822,11 +823,22 @@ def add_footer(canvas: np.ndarray, current_res: int, footer_h: int | None = None
     ip_rect = (x, row5_y + 20, x + 260, row5_y + 44)
     _draw_text_input(ip_rect, "OSC IP", osc_ip_text, UI_ACTIVE_TEXT == "osc_ip")
     UI_HITBOXES.append({"type": "text", "id": "osc_ip", "rect": ip_rect, "enabled": True})
-    x += 260 + 60
+    x += 260 + 20
 
-    port_rect = (x, row5_y + 20, x + 140, row5_y + 44)
+    port_rect = (x, row5_y + 20, x + 120, row5_y + 44)
     _draw_text_input(port_rect, "OSC PORT", osc_port_text, UI_ACTIVE_TEXT == "osc_port")
     UI_HITBOXES.append({"type": "text", "id": "osc_port", "rect": port_rect, "enabled": True})
+    x += 120 + 10
+
+    osc_btn = (x, row5_y + 20, x + 70, row5_y + 44)
+    _draw_button(canvas, osc_btn, "OSC", OSC_ENABLED, True)
+    UI_HITBOXES.append({"type": "toggle", "id": "osc_enabled", "rect": osc_btn, "enabled": True})
+    x += 70 + 8
+
+    chk_rect = (x, row5_y + 26, x + 12, row5_y + 38)
+    chk_color = (80, 180, 80) if OSC_ENABLED else (60, 60, 60)
+    cv2.rectangle(canvas, (chk_rect[0], chk_rect[1]), (chk_rect[2], chk_rect[3]), chk_color, -1)
+    cv2.rectangle(canvas, (chk_rect[0], chk_rect[1]), (chk_rect[2], chk_rect[3]), (90, 90, 90), 1)
 
 
 def _point_in_rect(x: int, y: int, rect: Tuple[int, int, int, int]) -> bool:
@@ -839,6 +851,7 @@ def _apply_button_action(item: dict) -> None:
     global BLUR_ENABLED, ROI_LIST, ROI_STATE, ROI_DIRTY
     global ENABLE_NDI_INPUT, ENABLE_NDI_OUTPUT, ENABLE_NDI_TRANSLATIONS_OUTPUT, CURRENT_SOURCE
     global ENABLE_RTSP_INPUT, RTSP_URL
+    global OSC_ENABLED
     item_id = item["id"]
     if item_id == "res":
         set_resolution_by_index(int(item["value"]))
@@ -904,6 +917,10 @@ def _apply_button_action(item: dict) -> None:
         load_rtsp_url_from_settings()
         save_settings()
         UI_PENDING_SOURCE = "rtsp"
+        return
+    if item_id == "osc_enabled":
+        OSC_ENABLED = not OSC_ENABLED
+        save_settings()
         return
 
 
@@ -1338,7 +1355,7 @@ def load_settings():
     global CURRENT_PEOPLE_LIMIT, BLUR_KERNEL_IDX, BLUR_ENABLED, MASK_THRESH
     global IMG_SIZE_IDX, HIGH_PRECISION_MODE, NDI_OUTPUT_MASK, CURRENT_SOURCE, SHOW_DETAIL, FLIP_INPUT
     global ENABLE_NDI_INPUT, ENABLE_NDI_OUTPUT, ENABLE_NDI_TRANSLATIONS_OUTPUT, ENABLE_RTSP_INPUT, RTSP_URL
-    global OSC_IP, OSC_PORT
+    global OSC_IP, OSC_PORT, OSC_ENABLED
     try:
         import json
 
@@ -1424,6 +1441,10 @@ def load_settings():
             OSC_PORT = osc_port
     except Exception:
         pass
+    try:
+        OSC_ENABLED = bool(data.get("osc_enabled", OSC_ENABLED))
+    except Exception:
+        pass
 
 
 def save_settings(extra: dict[str, Any] | None = None):
@@ -1442,6 +1463,7 @@ def save_settings(extra: dict[str, Any] | None = None):
         "rtsp_url": RTSP_URL,
         "osc_ip": OSC_IP,
         "osc_port": OSC_PORT,
+        "osc_enabled": OSC_ENABLED,
         "source": CURRENT_SOURCE,
         "show_detail": SHOW_DETAIL,
         "flip_input": FLIP_INPUT,
@@ -1881,6 +1903,7 @@ def main():
     last_osc_time = 0.0
     last_osc_people = None
     last_osc_masks = None
+    osc_sender.enabled = OSC_ENABLED
 
     last_result_seq = 0
     while True:
@@ -2205,6 +2228,11 @@ def main():
             if (OSC_IP, OSC_PORT) != last_osc_target:
                 osc_sender.update_target(OSC_IP, OSC_PORT)
                 last_osc_target = (OSC_IP, OSC_PORT)
+            if osc_sender.enabled != OSC_ENABLED:
+                osc_sender.enabled = OSC_ENABLED
+            if not OSC_ENABLED:
+                last_osc_time = osc_now
+                continue
             mask_payload = []
             if roi_w > 0 and roi_h > 0 and ROI_LIST:
                 scale_x = NDI_TR_OUTPUT_W / float(roi_w)
@@ -2251,6 +2279,7 @@ def main():
             round(PERSIST_FALL_TAU, 3),
             OSC_IP,
             OSC_PORT,
+            OSC_ENABLED,
             UI_ACTIVE_TEXT,
             UI_TEXT_BUFFER,
         )
