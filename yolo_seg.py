@@ -10,6 +10,8 @@ import sys
 import time
 import math
 import threading
+import socket
+import struct
 from typing import Tuple, Any, Optional
 import os
 import multiprocessing as mp
@@ -80,7 +82,7 @@ UI_MARGIN_LEFT = 20  # margen izquierdo para textos y GUI
 VIEW_LABEL_H = 24  # altura del label sobre cada vista
 VIEW_OFFSET_Y = 20  # baja las vistas (label + imagen) dentro del canvas
 CANVAS_WIDTH = 1536
-CANVAS_HEIGHT = 816  # extra altura para GUI inferior
+CANVAS_HEIGHT = 896  # extra altura para GUI inferior
 NDI_TR_OUTPUT_W = 1080
 NDI_TR_OUTPUT_H = 1920
 UI_BG_COLOR = (30, 30, 30)
@@ -105,6 +107,14 @@ ROI_MAX = 10
 ROI_STATE = []  # per-ROI assignment state (centroids/persistence)
 ROI_DIRTY = False
 
+# OSC settings + UI state
+OSC_IP = "127.0.0.1"
+OSC_PORT = 9000
+OSC_SEND_HZ = 20.0
+OSC_SEND_INTERVAL = 1.0 / OSC_SEND_HZ
+UI_ACTIVE_TEXT = None
+UI_TEXT_BUFFER = ""
+
 # UI state (footer GUI)
 UI_HITBOXES = []
 UI_ACTIVE_SLIDER = None
@@ -115,6 +125,7 @@ FOOTER_CACHE = None
 FOOTER_CACHE_KEY = None
 FOOTER_CACHE_HITBOXES = []
 FOOTER_PAD_Y = 10
+FOOTER_HEIGHT = 460
 SHOW_DETAIL_DEFAULT = False
 SHOW_DETAIL = SHOW_DETAIL_DEFAULT
 FLIP_INPUT = False
@@ -620,7 +631,7 @@ def add_footer(canvas: np.ndarray, current_res: int, footer_h: int | None = None
     global UI_HITBOXES
     UI_HITBOXES = []
     if footer_h is None:
-        footer_h = 380
+        footer_h = FOOTER_HEIGHT
     if footer_top is None:
         footer_top = canvas.shape[0] - footer_h
     cv2.rectangle(canvas, (0, footer_top), (canvas.shape[1], canvas.shape[0]), UI_BG_COLOR, -1)
@@ -629,10 +640,20 @@ def add_footer(canvas: np.ndarray, current_res: int, footer_h: int | None = None
     row2_y = row1_y + 70 + 50
     row3_y = row2_y + 70
     row4_y = row3_y + 70
+    row5_y = row4_y + 70
     btn_h = 24
     gap = 8
     x = UI_MARGIN_LEFT
     max_w = canvas.shape[1] - UI_MARGIN_LEFT
+
+    def _draw_text_input(rect: Tuple[int, int, int, int], label: str, text: str, active: bool) -> None:
+        x1, y1, x2, y2 = rect
+        _draw_label(canvas, label, x1, y1 - 6)
+        fill = (70, 70, 70) if active else (50, 50, 50)
+        cv2.rectangle(canvas, (x1, y1), (x2, y2), fill, -1)
+        cv2.rectangle(canvas, (x1, y1), (x2, y2), (90, 90, 90), 1)
+        display = text + ("_" if active else "")
+        cv2.putText(canvas, display[:24], (x1 + 6, y2 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (235, 235, 235), 1)
 
     def _wrap_if_needed(next_w: int) -> None:
         nonlocal x, row1_y
@@ -794,6 +815,19 @@ def add_footer(canvas: np.ndarray, current_res: int, footer_h: int | None = None
 
     # Bottom row for right panel moved to main canvas.
 
+    # Row 5: OSC target
+    x = UI_MARGIN_LEFT
+    osc_ip_text = UI_TEXT_BUFFER if UI_ACTIVE_TEXT == "osc_ip" else OSC_IP
+    osc_port_text = UI_TEXT_BUFFER if UI_ACTIVE_TEXT == "osc_port" else str(OSC_PORT)
+    ip_rect = (x, row5_y + 20, x + 260, row5_y + 44)
+    _draw_text_input(ip_rect, "OSC IP", osc_ip_text, UI_ACTIVE_TEXT == "osc_ip")
+    UI_HITBOXES.append({"type": "text", "id": "osc_ip", "rect": ip_rect, "enabled": True})
+    x += 260 + 60
+
+    port_rect = (x, row5_y + 20, x + 140, row5_y + 44)
+    _draw_text_input(port_rect, "OSC PORT", osc_port_text, UI_ACTIVE_TEXT == "osc_port")
+    UI_HITBOXES.append({"type": "text", "id": "osc_port", "rect": port_rect, "enabled": True})
+
 
 def _point_in_rect(x: int, y: int, rect: Tuple[int, int, int, int]) -> bool:
     x1, y1, x2, y2 = rect
@@ -873,6 +907,45 @@ def _apply_button_action(item: dict) -> None:
         return
 
 
+def _handle_text_input(key: int) -> bool:
+    global UI_ACTIVE_TEXT, UI_TEXT_BUFFER, OSC_IP, OSC_PORT
+    if UI_ACTIVE_TEXT is None:
+        return False
+    if key in (13, 10):  # Enter
+        if UI_ACTIVE_TEXT == "osc_ip":
+            val = UI_TEXT_BUFFER.strip()
+            if val:
+                OSC_IP = val
+        elif UI_ACTIVE_TEXT == "osc_port":
+            try:
+                val = int(UI_TEXT_BUFFER)
+                if 1 <= val <= 65535:
+                    OSC_PORT = val
+            except Exception:
+                pass
+        UI_ACTIVE_TEXT = None
+        UI_TEXT_BUFFER = ""
+        save_settings()
+        return True
+    if key == 27:  # Esc
+        UI_ACTIVE_TEXT = None
+        UI_TEXT_BUFFER = ""
+        return True
+    if key in (8, 127):  # Backspace
+        UI_TEXT_BUFFER = UI_TEXT_BUFFER[:-1]
+        return True
+    if 32 <= key <= 126:
+        ch = chr(key)
+        if UI_ACTIVE_TEXT == "osc_ip":
+            if ch.isalnum() or ch in ".-":
+                UI_TEXT_BUFFER = (UI_TEXT_BUFFER + ch)[:32]
+        else:
+            if ch.isdigit():
+                UI_TEXT_BUFFER = (UI_TEXT_BUFFER + ch)[:5]
+        return True
+    return True
+
+
 def _apply_slider_action(item: dict, x: int) -> None:
     global CURRENT_PEOPLE_LIMIT, BLUR_KERNEL_IDX, MASK_THRESH, IMG_SIZE_IDX
     x1, _, x2, _ = item["rect"]
@@ -931,6 +1004,7 @@ def _apply_slider_action(item: dict, x: int) -> None:
 
 def on_mouse(event: int, x: int, y: int, flags: int, param: Any) -> None:
     global UI_ACTIVE_SLIDER, ROI_ACTIVE_IDX, ROI_DRAG_OFFSET, ROI_DIRTY
+    global UI_ACTIVE_TEXT, UI_TEXT_BUFFER
 
     if event == cv2.EVENT_LBUTTONDOWN:
         if ROI_PANEL_BOUNDS_ABS is not None:
@@ -946,19 +1020,30 @@ def on_mouse(event: int, x: int, y: int, flags: int, param: Any) -> None:
                         ROI_DRAG_OFFSET = (roi["cx"] - local_x, roi["cy"] - local_y)
                         return
 
+        clicked_text = False
         for item in VIEW_HITBOXES + UI_HITBOXES:
             if not item.get("enabled", True):
                 continue
             if _point_in_rect(x, y, item["rect"]):
                 if item.get("type") == "view_tab":
                     globals()["ACTIVE_VIEW_TAB"] = item["value"]
+                    UI_ACTIVE_TEXT = None
                     return
                 if item["type"] in {"slider", "slider_steps"}:
                     UI_ACTIVE_SLIDER = item
+                    UI_ACTIVE_TEXT = None
                     _apply_slider_action(item, x)
                 else:
-                    _apply_button_action(item)
+                    if item.get("type") == "text":
+                        UI_ACTIVE_TEXT = item["id"]
+                        UI_TEXT_BUFFER = OSC_IP if UI_ACTIVE_TEXT == "osc_ip" else str(OSC_PORT)
+                        clicked_text = True
+                    else:
+                        UI_ACTIVE_TEXT = None
+                        _apply_button_action(item)
                 return
+        if not clicked_text:
+            UI_ACTIVE_TEXT = None
 
     if event == cv2.EVENT_MOUSEMOVE:
         if ROI_ACTIVE_IDX is not None and ROI_PANEL_BOUNDS_ABS is not None and flags & cv2.EVENT_FLAG_LBUTTON:
@@ -1253,6 +1338,7 @@ def load_settings():
     global CURRENT_PEOPLE_LIMIT, BLUR_KERNEL_IDX, BLUR_ENABLED, MASK_THRESH
     global IMG_SIZE_IDX, HIGH_PRECISION_MODE, NDI_OUTPUT_MASK, CURRENT_SOURCE, SHOW_DETAIL, FLIP_INPUT
     global ENABLE_NDI_INPUT, ENABLE_NDI_OUTPUT, ENABLE_NDI_TRANSLATIONS_OUTPUT, ENABLE_RTSP_INPUT, RTSP_URL
+    global OSC_IP, OSC_PORT
     try:
         import json
 
@@ -1326,6 +1412,18 @@ def load_settings():
             RTSP_URL = url
     except Exception:
         pass
+    try:
+        osc_ip = str(data.get("osc_ip", OSC_IP)).strip()
+        if osc_ip:
+            OSC_IP = osc_ip
+    except Exception:
+        pass
+    try:
+        osc_port = int(data.get("osc_port", OSC_PORT))
+        if 1 <= osc_port <= 65535:
+            OSC_PORT = osc_port
+    except Exception:
+        pass
 
 
 def save_settings(extra: dict[str, Any] | None = None):
@@ -1342,6 +1440,8 @@ def save_settings(extra: dict[str, Any] | None = None):
         "ndi_translations_output_enabled": ENABLE_NDI_TRANSLATIONS_OUTPUT,
         "rtsp_input_enabled": ENABLE_RTSP_INPUT,
         "rtsp_url": RTSP_URL,
+        "osc_ip": OSC_IP,
+        "osc_port": OSC_PORT,
         "source": CURRENT_SOURCE,
         "show_detail": SHOW_DETAIL,
         "flip_input": FLIP_INPUT,
@@ -1635,6 +1735,46 @@ class NDIReceiver:
         return
 
 
+# --------------- OSC helpers --------------------------------------
+def _osc_pad(data: bytes) -> bytes:
+    pad = (4 - (len(data) % 4)) % 4
+    return data + (b"\x00" * pad)
+
+
+def _osc_encode_str(text: str) -> bytes:
+    return _osc_pad(text.encode("ascii", errors="ignore") + b"\x00")
+
+
+class OSCSender:
+    """Minimal OSC UDP sender (ints/floats only) for efficiency."""
+
+    def __init__(self, ip: str, port: int):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.addr = (ip, port)
+        self.enabled = True
+
+    def update_target(self, ip: str, port: int) -> None:
+        self.addr = (ip, port)
+
+    def send(self, address: str, *args: Any) -> None:
+        if not self.enabled:
+            return
+        try:
+            types = ","
+            payload = b""
+            for arg in args:
+                if isinstance(arg, float):
+                    types += "f"
+                    payload += struct.pack(">f", float(arg))
+                else:
+                    types += "i"
+                    payload += struct.pack(">i", int(arg))
+            msg = _osc_encode_str(address) + _osc_encode_str(types) + payload
+            self.sock.sendto(msg, self.addr)
+        except Exception:
+            pass
+
+
 # --------------- loop principal ------------------------------------
 def main():
     # Carga modelo YOLOv8 de segmentación (usa uno ligero por defecto).
@@ -1706,7 +1846,7 @@ def main():
     window_name = "NEXT2 VISION - ROTOR STUDIO"
     canvas_size = (CANVAS_WIDTH, CANVAS_HEIGHT)  # width, height (3 panels + gap)
     header_h = 40
-    footer_h = 380
+    footer_h = FOOTER_HEIGHT
     cv2.setUseOptimized(True)
     cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE | cv2.WINDOW_GUI_NORMAL)
     cv2.setMouseCallback(window_name, on_mouse)
@@ -1736,6 +1876,11 @@ def main():
     ndi_trans_pub = (
         NDIPublisher("NEXT2 Translations NDI") if ENABLE_NDI and ENABLE_NDI_TRANSLATIONS_OUTPUT else None
     )
+    osc_sender = OSCSender(OSC_IP, OSC_PORT)
+    last_osc_target = (OSC_IP, OSC_PORT)
+    last_osc_time = 0.0
+    last_osc_people = None
+    last_osc_masks = None
 
     last_result_seq = 0
     while True:
@@ -2055,6 +2200,31 @@ def main():
             cap_fps = cap.get(cv2.CAP_PROP_FPS)
         add_header(canvas, fps, DEVICE, res_text, people_count, source_label(), cap_fps=cap_fps)
 
+        osc_now = time.time()
+        if osc_now - last_osc_time >= OSC_SEND_INTERVAL:
+            if (OSC_IP, OSC_PORT) != last_osc_target:
+                osc_sender.update_target(OSC_IP, OSC_PORT)
+                last_osc_target = (OSC_IP, OSC_PORT)
+            mask_payload = []
+            if roi_w > 0 and roi_h > 0 and ROI_LIST:
+                scale_x = NDI_TR_OUTPUT_W / float(roi_w)
+                scale_y = NDI_TR_OUTPUT_H / float(roi_h)
+                for idx, roi in enumerate(ROI_LIST):
+                    x_pos = int(roi["cx"] * scale_x)
+                    y_pos = int(roi["cy"] * scale_y)
+                    mask_payload.append((idx + 1, x_pos, y_pos))
+            if (
+                people_count != last_osc_people
+                or mask_payload != last_osc_masks
+                or (osc_now - last_osc_time) >= 1.0
+            ):
+                osc_sender.send("/personas", people_count)
+                for idx, x_pos, y_pos in mask_payload:
+                    osc_sender.send("/mask", idx, x_pos, y_pos)
+                last_osc_people = people_count
+                last_osc_masks = mask_payload
+                last_osc_time = osc_now
+
         footer_top = canvas.shape[0] - footer_h
         left_footer_w = third_w * 2
         footer_key = (
@@ -2079,6 +2249,10 @@ def main():
             round(PERSIST_HOLD_SEC, 3),
             round(PERSIST_RISE_TAU, 3),
             round(PERSIST_FALL_TAU, 3),
+            OSC_IP,
+            OSC_PORT,
+            UI_ACTIVE_TEXT,
+            UI_TEXT_BUFFER,
         )
         if FOOTER_CACHE is None or FOOTER_CACHE_KEY != footer_key:
             footer_layer = np.full((footer_h, left_footer_w, 3), UI_BG_COLOR, dtype=np.uint8)
@@ -2129,6 +2303,9 @@ def main():
             else:
                 key = cv2.waitKey(1) & 0xFF
             wait_ms = (time.perf_counter() - t_wait) * 1000.0
+        if key != 0 and UI_ACTIVE_TEXT is not None:
+            if _handle_text_input(key):
+                continue
         if key == ord("q"):
             break
         # Resolución por teclas 1-5
