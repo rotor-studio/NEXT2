@@ -54,13 +54,17 @@ ENABLE_NDI_INPUT = env_flag("NEXT_ENABLE_NDI_INPUT", True)
 ENABLE_NDI_OUTPUT = env_flag("NEXT_ENABLE_NDI_OUTPUT", True)  # Publicar máscara por NDI
 ENABLE_NDI_TRANSLATIONS_OUTPUT = env_flag("NEXT_ENABLE_NDI_TRANSLATIONS_OUTPUT", False)
 ENABLE_RTSP_INPUT = env_flag("NEXT_ENABLE_RTSP_INPUT", True)
+CAMERA_MAX_INDEX = max(0, int(os.environ.get("NEXT_CAMERA_MAX_INDEX", "3")))
+CAMERA_INDEX = max(0, min(int(os.environ.get("NEXT_CAMERA_INDEX", "0")), CAMERA_MAX_INDEX))
+CAMERA_INDEX_CHANGED = False
 RTSP_URL = os.environ.get(
     "NEXT_RTSP_URL",
     "rtsp://192.168.0.215:5543/c9fa2e29ba99618fc28088ccae18076b/live/channel0",
 ).strip()
 RTSP_TRANSPORT = os.environ.get("NEXT_RTSP_TRANSPORT", "udp").strip().lower()
 RTSP_RECONNECT_SEC = float(os.environ.get("NEXT_RTSP_RECONNECT_SEC", "2.0"))
-USE_RTSP_THREAD = False
+RTSP_GRAB_SKIP = max(0, int(os.environ.get("NEXT_RTSP_GRAB_SKIP", "0")))
+USE_RTSP_THREAD = env_flag("NEXT_RTSP_THREAD", True)
 DATA_DIR = Path(__file__).with_name("DATA")
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv"}
 VIDEO_FILES = sorted([p for p in DATA_DIR.glob("*") if p.suffix.lower() in VIDEO_EXTS])
@@ -852,6 +856,7 @@ def _apply_button_action(item: dict) -> None:
     global ENABLE_NDI_INPUT, ENABLE_NDI_OUTPUT, ENABLE_NDI_TRANSLATIONS_OUTPUT, CURRENT_SOURCE
     global ENABLE_RTSP_INPUT, RTSP_URL
     global OSC_ENABLED
+    global CAMERA_INDEX, CAMERA_INDEX_CHANGED
     item_id = item["id"]
     if item_id == "res":
         set_resolution_by_index(int(item["value"]))
@@ -861,6 +866,19 @@ def _apply_button_action(item: dict) -> None:
         UI_PENDING_MODEL_KEY = item["value"]
         return
     if item_id == "source":
+        if item["value"] == "camera" and CURRENT_SOURCE == "camera":
+            next_idx = None
+            for step in range(1, CAMERA_MAX_INDEX + 2):
+                cand = (CAMERA_INDEX + step) % (CAMERA_MAX_INDEX + 1)
+                if _probe_camera_index(cand):
+                    next_idx = cand
+                    break
+            if next_idx is not None:
+                globals()["CAMERA_INDEX"] = next_idx
+                globals()["CAMERA_INDEX_CHANGED"] = True
+                save_settings()
+                UI_PENDING_SOURCE = "camera"
+            return
         UI_PENDING_SOURCE = item["value"]
         return
     if item_id == "mask_view":
@@ -1180,7 +1198,13 @@ def open_capture(source: str):
     """Open capture for camera, video file, or NDI."""
     global CURRENT_VIDEO_INDEX
     if source == "camera":
-        cap = cv2.VideoCapture(0)
+        global CAMERA_INDEX
+        picked = _pick_camera_index(CAMERA_INDEX)
+        if picked is None:
+            print("[CAM] No hay cámaras disponibles.", file=sys.stderr)
+            return None
+        CAMERA_INDEX = picked
+        cap = cv2.VideoCapture(CAMERA_INDEX)
         if cap.isOpened():
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAP_WIDTH)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAP_HEIGHT)
@@ -1194,15 +1218,17 @@ def open_capture(source: str):
         if "OPENCV_FFMPEG_CAPTURE_OPTIONS" not in os.environ:
             transport = "tcp" if RTSP_TRANSPORT == "tcp" else "udp"
             os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
-                f"rtsp_transport;{transport}|fflags;nobuffer|flags;low_delay"
+                f"rtsp_transport;{transport}|fflags;nobuffer|flags;low_delay|framedrop;1|max_delay;0|reorder_queue_size;0"
             )
-        cap = cv2.VideoCapture(RTSP_URL)
+        cap = cv2.VideoCapture(RTSP_URL, cv2.CAP_FFMPEG)
         try:
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 2000)
+            cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 2000)
         except Exception:
             pass
         if USE_RTSP_THREAD:
-            return LatestFrameCapture(cap)
+            return LatestFrameCapture(cap, grab_skip=RTSP_GRAB_SKIP)
         return cap
     if source == "video":
         if not VIDEO_FILES:
@@ -1270,8 +1296,8 @@ def apply_model_change(model: YOLO, new_key: int, load: bool = True) -> YOLO:
 
 def apply_source_change(new_source: str, cap):
     """Swap capture source; keeps previous on failure."""
-    global CURRENT_SOURCE, CURRENT_VIDEO_INDEX
-    if new_source == CURRENT_SOURCE:
+    global CURRENT_SOURCE, CURRENT_VIDEO_INDEX, CAMERA_INDEX_CHANGED
+    if new_source == CURRENT_SOURCE and not (new_source == "camera" and CAMERA_INDEX_CHANGED):
         return cap
     if new_source == "video" and not VIDEO_FILES:
         return cap
@@ -1292,7 +1318,36 @@ def apply_source_change(new_source: str, cap):
         cap = prev_cap
     else:
         save_settings()
+        CAMERA_INDEX_CHANGED = False
     return cap
+
+
+def _probe_camera_index(idx: int) -> bool:
+    cap = cv2.VideoCapture(idx)
+    ok = False
+    try:
+        if cap.isOpened():
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAP_WIDTH)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAP_HEIGHT)
+            ok = True
+    except Exception:
+        ok = False
+    try:
+        cap.release()
+    except Exception:
+        pass
+    return ok
+
+
+def _pick_camera_index(start_idx: int) -> int | None:
+    if _probe_camera_index(start_idx):
+        return start_idx
+    for cand in range(CAMERA_MAX_INDEX + 1):
+        if cand == start_idx:
+            continue
+        if _probe_camera_index(cand):
+            return cand
+    return None
 
 
 # --------------- helpers NDI --------------------------------------
@@ -1356,6 +1411,7 @@ def load_settings():
     global IMG_SIZE_IDX, HIGH_PRECISION_MODE, NDI_OUTPUT_MASK, CURRENT_SOURCE, SHOW_DETAIL, FLIP_INPUT
     global ENABLE_NDI_INPUT, ENABLE_NDI_OUTPUT, ENABLE_NDI_TRANSLATIONS_OUTPUT, ENABLE_RTSP_INPUT, RTSP_URL
     global OSC_IP, OSC_PORT, OSC_ENABLED
+    global CAMERA_INDEX
     try:
         import json
 
@@ -1430,6 +1486,12 @@ def load_settings():
     except Exception:
         pass
     try:
+        cam_idx = int(data.get("camera_index", CAMERA_INDEX))
+        if 0 <= cam_idx <= CAMERA_MAX_INDEX:
+            CAMERA_INDEX = cam_idx
+    except Exception:
+        pass
+    try:
         osc_ip = str(data.get("osc_ip", OSC_IP)).strip()
         if osc_ip:
             OSC_IP = osc_ip
@@ -1461,6 +1523,7 @@ def save_settings(extra: dict[str, Any] | None = None):
         "ndi_translations_output_enabled": ENABLE_NDI_TRANSLATIONS_OUTPUT,
         "rtsp_input_enabled": ENABLE_RTSP_INPUT,
         "rtsp_url": RTSP_URL,
+        "camera_index": CAMERA_INDEX,
         "osc_ip": OSC_IP,
         "osc_port": OSC_PORT,
         "osc_enabled": OSC_ENABLED,
@@ -1548,8 +1611,9 @@ class InferenceWorker:
 class LatestFrameCapture:
     """Background reader that always exposes the latest frame (low-latency)."""
 
-    def __init__(self, cap: cv2.VideoCapture):
+    def __init__(self, cap: cv2.VideoCapture, grab_skip: int = 0):
         self.cap = cap
+        self.grab_skip = max(0, int(grab_skip))
         self.lock = threading.Lock()
         self.frame = None
         self.new = False
@@ -1559,7 +1623,17 @@ class LatestFrameCapture:
 
     def _loop(self) -> None:
         while not self.stop_event.is_set():
-            ok, frame = self.cap.read()
+            if self.grab_skip > 0:
+                ok = self.cap.grab()
+                if not ok:
+                    time.sleep(0.005)
+                    continue
+                for _ in range(self.grab_skip):
+                    if not self.cap.grab():
+                        break
+                ok, frame = self.cap.retrieve()
+            else:
+                ok, frame = self.cap.read()
             if not ok:
                 time.sleep(0.005)
                 continue
@@ -1579,7 +1653,9 @@ class LatestFrameCapture:
 
     def release(self):
         self.stop_event.set()
-        self.thread.join(timeout=0.5)
+        self.thread.join(timeout=1.5)
+        if self.thread.is_alive():
+            return
         if self.cap is not None:
             try:
                 self.cap.release()
@@ -1806,6 +1882,7 @@ def main():
     global ENABLE_NDI_INPUT, ENABLE_NDI_OUTPUT, ENABLE_NDI_TRANSLATIONS_OUTPUT, ENABLE_RTSP_INPUT
     global UI_PENDING_MODEL_KEY, UI_PENDING_SOURCE, VIEW_HITBOXES, ROI_PANEL_BOUNDS, ROI_PANEL_BOUNDS_ABS
     global FOOTER_CACHE, FOOTER_CACHE_KEY, FOOTER_CACHE_HITBOXES, UI_HITBOXES
+    global CAMERA_INDEX, CAMERA_INDEX_CHANGED
     load_saved_resolution()
     load_saved_model()
     load_settings()
@@ -2277,6 +2354,7 @@ def main():
             round(PERSIST_HOLD_SEC, 3),
             round(PERSIST_RISE_TAU, 3),
             round(PERSIST_FALL_TAU, 3),
+            CAMERA_INDEX,
             OSC_IP,
             OSC_PORT,
             OSC_ENABLED,
@@ -2377,9 +2455,31 @@ def main():
             save_settings()
         # Cambio de fuente
         if key == ord("c"):
+            if CURRENT_SOURCE == "camera":
+                next_idx = None
+                for step in range(1, CAMERA_MAX_INDEX + 2):
+                    cand = (CAMERA_INDEX + step) % (CAMERA_MAX_INDEX + 1)
+                    if _probe_camera_index(cand):
+                        next_idx = cand
+                        break
+                if next_idx is not None:
+                    CAMERA_INDEX = next_idx
+                    CAMERA_INDEX_CHANGED = True
+                    save_settings()
             cap = apply_source_change("camera", cap)
-        if key == ord("v") and VIDEO_FILES:
-            cap = apply_source_change("video", cap)
+        if key == ord("v"):
+            if CURRENT_SOURCE == "camera":
+                next_idx = None
+                for step in range(1, CAMERA_MAX_INDEX + 2):
+                    cand = (CAMERA_INDEX + step) % (CAMERA_MAX_INDEX + 1)
+                    if _probe_camera_index(cand):
+                        next_idx = cand
+                        break
+                if next_idx is not None:
+                    CAMERA_INDEX = next_idx
+                    CAMERA_INDEX_CHANGED = True
+                    save_settings()
+            cap = apply_source_change("camera", cap)
         if key == ord("n") and ENABLE_NDI and ENABLE_NDI_INPUT:
             cap = apply_source_change("ndi", cap)
         if key == ord("r"):
