@@ -111,6 +111,14 @@ ROI_MAX = 10
 ROI_STATE = []  # per-ROI assignment state (centroids/persistence)
 ROI_DIRTY = False
 
+MASK_ROI_LIST = []
+MASK_ROI_ACTIVE_IDX = None
+MASK_ROI_DRAG_OFFSET = (0, 0)
+MASK_ROI_PANEL_BOUNDS = None  # (w, h) for mask panel image area (local)
+MASK_ROI_PANEL_BOUNDS_ABS = None  # (x0, y0, w, h) absolute for mouse
+MASK_ROI_DIRTY = False
+MASK_PANEL_FIT = None  # (scale, x_off, y_off, new_w, new_h, src_w, src_h)
+
 # OSC settings + UI state
 OSC_IP = "127.0.0.1"
 OSC_PORT = 9000
@@ -395,6 +403,45 @@ def add_roi() -> None:
     _clamp_roi(roi, w, h)
     ROI_LIST.append(roi)
     ROI_DIRTY = True
+
+
+def add_mask_roi() -> None:
+    global MASK_ROI_LIST, MASK_ROI_DIRTY
+    if MASK_ROI_PANEL_BOUNDS is None or len(MASK_ROI_LIST) >= ROI_MAX:
+        return
+    w, h = MASK_ROI_PANEL_BOUNDS
+    half = max(20, min(w, h) // 6)
+    roi = {"cx": w // 2, "cy": h // 2, "half": half}
+    _clamp_roi(roi, w, h)
+    MASK_ROI_LIST.append(roi)
+    MASK_ROI_DIRTY = True
+
+
+def mask_rois_to_masks(mask: np.ndarray) -> list[np.ndarray]:
+    if not MASK_ROI_LIST or MASK_PANEL_FIT is None:
+        return []
+    scale, x_off, y_off, new_w, new_h, src_w, src_h = MASK_PANEL_FIT
+    if scale <= 0:
+        return []
+    masks = []
+    for roi in MASK_ROI_LIST:
+        x1, y1, x2, y2 = _roi_rect(roi)
+        disp_x1 = max(0, min(new_w, x1 - x_off))
+        disp_y1 = max(0, min(new_h, y1 - y_off))
+        disp_x2 = max(0, min(new_w, x2 - x_off))
+        disp_y2 = max(0, min(new_h, y2 - y_off))
+        if disp_x2 <= disp_x1 or disp_y2 <= disp_y1:
+            masks.append(np.zeros_like(mask))
+            continue
+        src_x1 = max(0, min(src_w, int(disp_x1 / scale)))
+        src_y1 = max(0, min(src_h, int(disp_y1 / scale)))
+        src_x2 = max(0, min(src_w, int(disp_x2 / scale)))
+        src_y2 = max(0, min(src_h, int(disp_y2 / scale)))
+        roi_mask = np.zeros_like(mask)
+        if src_x2 > src_x1 and src_y2 > src_y1:
+            roi_mask[src_y1:src_y2, src_x1:src_x2] = mask[src_y1:src_y2, src_x1:src_x2]
+        masks.append(roi_mask)
+    return masks
 
 
 def translate_masks_to_rois(
@@ -853,6 +900,7 @@ def _point_in_rect(x: int, y: int, rect: Tuple[int, int, int, int]) -> bool:
 def _apply_button_action(item: dict) -> None:
     global UI_PENDING_MODEL_KEY, UI_PENDING_SOURCE, SHOW_DETAIL, FLIP_INPUT, HIGH_PRECISION_MODE
     global BLUR_ENABLED, ROI_LIST, ROI_STATE, ROI_DIRTY
+    global MASK_ROI_LIST, MASK_ROI_DIRTY
     global ENABLE_NDI_INPUT, ENABLE_NDI_OUTPUT, ENABLE_NDI_TRANSLATIONS_OUTPUT, CURRENT_SOURCE
     global ENABLE_RTSP_INPUT, RTSP_URL
     global OSC_ENABLED
@@ -910,6 +958,18 @@ def _apply_button_action(item: dict) -> None:
         ROI_LIST.clear()
         ROI_STATE.clear()
         ROI_DIRTY = True
+        return
+    if item_id == "mask_roi_add":
+        add_mask_roi()
+        return
+    if item_id == "mask_roi_remove":
+        if MASK_ROI_LIST:
+            MASK_ROI_LIST.pop()
+            MASK_ROI_DIRTY = True
+        return
+    if item_id == "mask_roi_reset":
+        MASK_ROI_LIST.clear()
+        MASK_ROI_DIRTY = True
         return
     if item_id == "ndi_input":
         ENABLE_NDI_INPUT = not ENABLE_NDI_INPUT
@@ -1039,6 +1099,7 @@ def _apply_slider_action(item: dict, x: int) -> None:
 
 def on_mouse(event: int, x: int, y: int, flags: int, param: Any) -> None:
     global UI_ACTIVE_SLIDER, ROI_ACTIVE_IDX, ROI_DRAG_OFFSET, ROI_DIRTY
+    global MASK_ROI_ACTIVE_IDX, MASK_ROI_DRAG_OFFSET, MASK_ROI_DIRTY
     global UI_ACTIVE_TEXT, UI_TEXT_BUFFER
 
     if event == cv2.EVENT_LBUTTONDOWN:
@@ -1053,6 +1114,18 @@ def on_mouse(event: int, x: int, y: int, flags: int, param: Any) -> None:
                     if rx1 <= local_x <= rx2 and ry1 <= local_y <= ry2:
                         ROI_ACTIVE_IDX = real_idx
                         ROI_DRAG_OFFSET = (roi["cx"] - local_x, roi["cy"] - local_y)
+                        return
+        if MASK_ROI_PANEL_BOUNDS_ABS is not None:
+            bx, by, bw, bh = MASK_ROI_PANEL_BOUNDS_ABS
+            if bx <= x <= bx + bw and by <= y <= by + bh:
+                local_x = x - bx
+                local_y = y - by
+                for idx, roi in enumerate(reversed(MASK_ROI_LIST)):
+                    real_idx = len(MASK_ROI_LIST) - 1 - idx
+                    rx1, ry1, rx2, ry2 = _roi_rect(roi)
+                    if rx1 <= local_x <= rx2 and ry1 <= local_y <= ry2:
+                        MASK_ROI_ACTIVE_IDX = real_idx
+                        MASK_ROI_DRAG_OFFSET = (roi["cx"] - local_x, roi["cy"] - local_y)
                         return
 
         clicked_text = False
@@ -1092,41 +1165,78 @@ def on_mouse(event: int, x: int, y: int, flags: int, param: Any) -> None:
             _clamp_roi(roi, bw, bh)
             ROI_DIRTY = True
             return
+        if (
+            MASK_ROI_ACTIVE_IDX is not None
+            and MASK_ROI_PANEL_BOUNDS_ABS is not None
+            and flags & cv2.EVENT_FLAG_LBUTTON
+        ):
+            bx, by, bw, bh = MASK_ROI_PANEL_BOUNDS_ABS
+            local_x = x - bx
+            local_y = y - by
+            dx, dy = MASK_ROI_DRAG_OFFSET
+            roi = MASK_ROI_LIST[MASK_ROI_ACTIVE_IDX]
+            roi["cx"] = int(local_x + dx)
+            roi["cy"] = int(local_y + dy)
+            _clamp_roi(roi, bw, bh)
+            MASK_ROI_DIRTY = True
+            return
         if UI_ACTIVE_SLIDER is not None and flags & cv2.EVENT_FLAG_LBUTTON:
             _apply_slider_action(UI_ACTIVE_SLIDER, x)
             return
 
     if event == cv2.EVENT_MOUSEWHEEL:
         if ROI_PANEL_BOUNDS_ABS is None:
-            return
-        bx, by, bw, bh = ROI_PANEL_BOUNDS_ABS
-        if not (bx <= x <= bx + bw and by <= y <= by + bh):
-            return
+            bx = by = bw = bh = None
+        else:
+            bx, by, bw, bh = ROI_PANEL_BOUNDS_ABS
         delta = (flags >> 16) & 0xFFFF
         if delta & 0x8000:
             delta = delta - 0x10000
         if delta == 0:
             return
-        local_x = x - bx
-        local_y = y - by
-        target_idx = None
-        for idx in range(len(ROI_LIST) - 1, -1, -1):
-            rx1, ry1, rx2, ry2 = _roi_rect(ROI_LIST[idx])
-            if rx1 <= local_x <= rx2 and ry1 <= local_y <= ry2:
-                target_idx = idx
-                break
-        if target_idx is None:
-            return
-        roi = ROI_LIST[target_idx]
-        step = 6 if delta > 0 else -6
-        roi["half"] = int(roi["half"]) + step
-        _clamp_roi(roi, bw, bh)
-        ROI_DIRTY = True
+        handled = False
+        if ROI_PANEL_BOUNDS_ABS is not None and bx <= x <= bx + bw and by <= y <= by + bh:
+            local_x = x - bx
+            local_y = y - by
+            target_idx = None
+            for idx in range(len(ROI_LIST) - 1, -1, -1):
+                rx1, ry1, rx2, ry2 = _roi_rect(ROI_LIST[idx])
+                if rx1 <= local_x <= rx2 and ry1 <= local_y <= ry2:
+                    target_idx = idx
+                    break
+            if target_idx is not None:
+                roi = ROI_LIST[target_idx]
+                step = 6 if delta > 0 else -6
+                roi["half"] = int(roi["half"]) + step
+                _clamp_roi(roi, bw, bh)
+                ROI_DIRTY = True
+                handled = True
+        if (
+            not handled
+            and MASK_ROI_PANEL_BOUNDS_ABS is not None
+        ):
+            bx, by, bw, bh = MASK_ROI_PANEL_BOUNDS_ABS
+            if bx <= x <= bx + bw and by <= y <= by + bh:
+                local_x = x - bx
+                local_y = y - by
+                target_idx = None
+                for idx in range(len(MASK_ROI_LIST) - 1, -1, -1):
+                    rx1, ry1, rx2, ry2 = _roi_rect(MASK_ROI_LIST[idx])
+                    if rx1 <= local_x <= rx2 and ry1 <= local_y <= ry2:
+                        target_idx = idx
+                        break
+                if target_idx is not None:
+                    roi = MASK_ROI_LIST[target_idx]
+                    step = 6 if delta > 0 else -6
+                    roi["half"] = int(roi["half"]) + step
+                    _clamp_roi(roi, bw, bh)
+                    MASK_ROI_DIRTY = True
         return
 
     if event == cv2.EVENT_LBUTTONUP:
         UI_ACTIVE_SLIDER = None
         ROI_ACTIVE_IDX = None
+        MASK_ROI_ACTIVE_IDX = None
 
 
 def set_resolution_by_index(idx: int):
@@ -1881,6 +1991,7 @@ def main():
     global BLUR_KERNEL_IDX, MASK_THRESH, BLUR_ENABLED, IMG_SIZE_IDX, HIGH_PRECISION_MODE, ENABLE_NDI, DEFAULT_SOURCE, SHOW_DETAIL, FLIP_INPUT
     global ENABLE_NDI_INPUT, ENABLE_NDI_OUTPUT, ENABLE_NDI_TRANSLATIONS_OUTPUT, ENABLE_RTSP_INPUT
     global UI_PENDING_MODEL_KEY, UI_PENDING_SOURCE, VIEW_HITBOXES, ROI_PANEL_BOUNDS, ROI_PANEL_BOUNDS_ABS
+    global MASK_ROI_PANEL_BOUNDS, MASK_ROI_PANEL_BOUNDS_ABS, MASK_PANEL_FIT
     global FOOTER_CACHE, FOOTER_CACHE_KEY, FOOTER_CACHE_HITBOXES, UI_HITBOXES
     global CAMERA_INDEX, CAMERA_INDEX_CHANGED
     load_saved_resolution()
@@ -1961,6 +2072,8 @@ def main():
     cached_middle_view = None
     cached_middle_key = None
     cached_translated = None
+    cached_mask_roi_masks = None
+    cached_mask_roi_key = None
     cached_left_view = None
     cached_left_key = None
     cached_left_labeled = None
@@ -2024,7 +2137,7 @@ def main():
 
         do_process = (frame_idx % PROCESS_EVERY_N == 0 or last_mask_soft is None) and got_new_frame
         if do_process:
-            need_person_masks = len(ROI_LIST) > 0
+            need_person_masks = len(ROI_LIST) > 0 and len(MASK_ROI_LIST) == 0
             if infer_worker is not None:
                 infer_worker.update_frame(
                     frame,
@@ -2149,6 +2262,45 @@ def main():
                 (("mask", "Mask"), ("mod", "Suavizado")),
                 ACTIVE_VIEW_TAB,
             )
+        mask_label_h = min(VIEW_LABEL_H, max(16, view_h // 6))
+        mask_panel_w = third_w
+        mask_panel_h = max(1, view_h - mask_label_h)
+        MASK_ROI_PANEL_BOUNDS = (mask_panel_w, mask_panel_h)
+        MASK_ROI_PANEL_BOUNDS_ABS = (third_w, view_y + mask_label_h, mask_panel_w, mask_panel_h)
+        src_h, src_w = mask_to_show.shape[:2]
+        mask_scale = min(mask_panel_w / float(src_w), mask_panel_h / float(src_h))
+        new_w = max(1, int(src_w * mask_scale))
+        new_h = max(1, int(src_h * mask_scale))
+        x_off = 0 if new_w >= mask_panel_w else (mask_panel_w - new_w) // 2
+        y_off = 0
+        MASK_PANEL_FIT = (mask_scale, x_off, y_off, new_w, new_h, src_w, src_h)
+        if MASK_ROI_LIST:
+            middle_view = middle_view.copy()
+            for roi in MASK_ROI_LIST:
+                _clamp_roi(roi, mask_panel_w, mask_panel_h)
+                x1, y1, x2, y2 = _roi_rect(roi)
+                x1 = max(0, min(mask_panel_w - 1, x1))
+                y1 = max(0, min(mask_panel_h - 1, y1))
+                x2 = max(0, min(mask_panel_w - 1, x2))
+                y2 = max(0, min(mask_panel_h - 1, y2))
+                if x2 > x1 and y2 > y1:
+                    cv2.rectangle(
+                        middle_view,
+                        (x1, mask_label_h + y1),
+                        (x2, mask_label_h + y2),
+                        (0, 200, 120),
+                        2,
+                    )
+        mask_roi_masks = None
+        if MASK_ROI_LIST:
+            if cached_mask_roi_masks is None or MASK_ROI_DIRTY or do_process:
+                mask_roi_masks = mask_rois_to_masks(mask_to_show)
+                cached_mask_roi_masks = mask_roi_masks
+                MASK_ROI_DIRTY = False
+            else:
+                mask_roi_masks = cached_mask_roi_masks
+        else:
+            cached_mask_roi_masks = None
         roi_avail_w = third_w
         roi_avail_h = max(1, right_view_h - VIEW_LABEL_H)
         roi_scale = min(
@@ -2159,12 +2311,14 @@ def main():
         roi_h = max(1, int(NDI_TR_OUTPUT_H * roi_scale))
         roi_x_off = max(0, (third_w - roi_w) // 2)
         roi_y_off = VIEW_LABEL_H  # align to top under label, like other views
-        if cached_translated is None or ROI_DIRTY or do_process:
+        source_masks = mask_roi_masks if MASK_ROI_LIST else person_masks
+        if cached_translated is None or ROI_DIRTY or MASK_ROI_DIRTY or do_process:
             translated = translate_masks_to_rois(
-                person_masks, ROI_LIST, (roi_w, roi_h), now, max(dt, 1e-6)
+                source_masks, ROI_LIST, (roi_w, roi_h), now, max(dt, 1e-6)
             )
             cached_translated = translated
             ROI_DIRTY = False
+            MASK_ROI_DIRTY = False
         else:
             translated = cached_translated
         right_key = (id(translated), roi_w, roi_h)
@@ -2291,6 +2445,25 @@ def main():
         mid_btn = (mid_x0 + pad, btn_y, mid_x0 + pad + 100, btn_y + btn_h)
         _draw_button(canvas, mid_btn, "NDI OUT", ENABLE_NDI_OUTPUT, ENABLE_NDI)
         VIEW_HITBOXES.append({"type": "toggle", "id": "ndi_output", "rect": mid_btn, "enabled": ENABLE_NDI})
+        mbtn_x = mid_btn[2] + 8
+        mbtn_y = btn_y
+        roi_add_btn = (mbtn_x, mbtn_y, mbtn_x + 70, mbtn_y + btn_h)
+        _draw_button(canvas, roi_add_btn, "ROI +", False, len(MASK_ROI_LIST) < ROI_MAX)
+        VIEW_HITBOXES.append(
+            {"type": "button", "id": "mask_roi_add", "rect": roi_add_btn, "enabled": len(MASK_ROI_LIST) < ROI_MAX}
+        )
+        mbtn_x = roi_add_btn[2] + 6
+        roi_rm_btn = (mbtn_x, mbtn_y, mbtn_x + 60, mbtn_y + btn_h)
+        _draw_button(canvas, roi_rm_btn, "ROI -", False, len(MASK_ROI_LIST) > 0)
+        VIEW_HITBOXES.append(
+            {"type": "button", "id": "mask_roi_remove", "rect": roi_rm_btn, "enabled": len(MASK_ROI_LIST) > 0}
+        )
+        mbtn_x = roi_rm_btn[2] + 6
+        roi_reset_btn = (mbtn_x, mbtn_y, mbtn_x + 90, mbtn_y + btn_h)
+        _draw_button(canvas, roi_reset_btn, "ROI reset", False, len(MASK_ROI_LIST) > 0)
+        VIEW_HITBOXES.append(
+            {"type": "button", "id": "mask_roi_reset", "rect": roi_reset_btn, "enabled": len(MASK_ROI_LIST) > 0}
+        )
 
 
         res_text = f"{frame.shape[1]}x{frame.shape[0]}"
