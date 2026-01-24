@@ -27,9 +27,15 @@ RES_OPTIONS = [160, 240, 320, 360, 480]  # opciones de altura máxima
 CURRENT_MAX_HEIGHT = 240  # valor inicial (se sobreescribe si hay guardado)
 IMG_SIZE_OPTIONS = [320, 480, 640]  # resoluciones de inferencia YOLO
 IMG_SIZE_IDX = 0  # índice inicial -> 320
-PROCESS_EVERY_N = 2  # procesa 1 de cada N frames (2 = mitad)
+PROCESS_EVERY_N = max(1, int(os.environ.get("NEXT_PROCESS_EVERY_N", "2")))  # procesa 1 de cada N frames
 CAP_WIDTH = 640   # resolución solicitada a la cámara (puede ajustarse)
 CAP_HEIGHT = 480
+PROCESS_EVERY_OPTIONS = [1, 2, 3, 4]
+CAM_FPS_OPTIONS = [15, 30, 60]
+CAM_RES_OPTIONS = [0, 360, 480, 720]  # 0 => auto (match MAXH)
+CAM_FOURCC_OPTIONS = ["MJPG", "YUY2"]
+CAMERA_FPS = max(1, int(os.environ.get("NEXT_CAMERA_FPS", "60")))
+CAMERA_FOURCC = os.environ.get("NEXT_CAMERA_FOURCC", "MJPG").strip().upper()
 DEVICE = None
 RES_SAVE_FILE = Path(__file__).with_name("resolution.txt")
 MODEL_SAVE_FILE = Path(__file__).with_name("model.txt")
@@ -54,6 +60,9 @@ ENABLE_NDI_INPUT = env_flag("NEXT_ENABLE_NDI_INPUT", True)
 ENABLE_NDI_OUTPUT = env_flag("NEXT_ENABLE_NDI_OUTPUT", True)  # Publicar máscara por NDI
 ENABLE_NDI_TRANSLATIONS_OUTPUT = env_flag("NEXT_ENABLE_NDI_TRANSLATIONS_OUTPUT", False)
 ENABLE_RTSP_INPUT = env_flag("NEXT_ENABLE_RTSP_INPUT", True)
+CAMERA_MATCH_MAXH = env_flag("NEXT_CAMERA_MATCH_MAXH", True)
+CAMERA_REQ_WIDTH = max(0, int(os.environ.get("NEXT_CAMERA_WIDTH", "0")))
+CAMERA_REQ_HEIGHT = max(0, int(os.environ.get("NEXT_CAMERA_HEIGHT", "0")))
 CAMERA_MAX_INDEX = max(0, int(os.environ.get("NEXT_CAMERA_MAX_INDEX", "3")))
 CAMERA_INDEX = max(0, min(int(os.environ.get("NEXT_CAMERA_INDEX", "0")), CAMERA_MAX_INDEX))
 CAMERA_INDEX_CHANGED = False
@@ -65,6 +74,8 @@ RTSP_TRANSPORT = os.environ.get("NEXT_RTSP_TRANSPORT", "udp").strip().lower()
 RTSP_RECONNECT_SEC = float(os.environ.get("NEXT_RTSP_RECONNECT_SEC", "2.0"))
 RTSP_GRAB_SKIP = max(0, int(os.environ.get("NEXT_RTSP_GRAB_SKIP", "0")))
 USE_RTSP_THREAD = env_flag("NEXT_RTSP_THREAD", True)
+USE_CAMERA_THREAD = env_flag("NEXT_CAMERA_THREAD", True)
+CAMERA_GRAB_SKIP = max(0, int(os.environ.get("NEXT_CAMERA_GRAB_SKIP", "0")))
 DATA_DIR = Path(__file__).with_name("DATA")
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv"}
 VIDEO_FILES = sorted([p for p in DATA_DIR.glob("*") if p.suffix.lower() in VIDEO_EXTS])
@@ -86,7 +97,7 @@ UI_MARGIN_LEFT = 20  # margen izquierdo para textos y GUI
 VIEW_LABEL_H = 24  # altura del label sobre cada vista
 VIEW_OFFSET_Y = 20  # baja las vistas (label + imagen) dentro del canvas
 CANVAS_WIDTH = 1536
-CANVAS_HEIGHT = 896  # extra altura para GUI inferior
+CANVAS_HEIGHT = 980  # extra altura para GUI inferior
 NDI_TR_OUTPUT_W = 1080
 NDI_TR_OUTPUT_H = 1920
 UI_BG_COLOR = (30, 30, 30)
@@ -138,7 +149,7 @@ FOOTER_CACHE = None
 FOOTER_CACHE_KEY = None
 FOOTER_CACHE_HITBOXES = []
 FOOTER_PAD_Y = 10
-FOOTER_HEIGHT = 460
+FOOTER_HEIGHT = 560
 SHOW_DETAIL_DEFAULT = False
 SHOW_DETAIL = SHOW_DETAIL_DEFAULT
 FLIP_INPUT = False
@@ -211,7 +222,8 @@ def segment_people(
     """
     h, w = frame.shape[:2]
     imgsz = max(IMG_SIZE_OPTIONS) if HIGH_PRECISION_MODE else IMG_SIZE_OPTIONS[IMG_SIZE_IDX]
-    result = model(frame, imgsz=imgsz, verbose=False, device=DEVICE)[0]
+    with torch.inference_mode():
+        result = model(frame, imgsz=imgsz, verbose=False, device=DEVICE)[0]
 
     # If the model returns no masks, bail early.
     if result.masks is None or result.boxes is None:
@@ -688,7 +700,9 @@ def add_footer(canvas: np.ndarray, current_res: int, footer_h: int | None = None
         footer_top = canvas.shape[0] - footer_h
     cv2.rectangle(canvas, (0, footer_top), (canvas.shape[1], canvas.shape[0]), UI_BG_COLOR, -1)
 
-    row1_y = footer_top + FOOTER_UI_OFFSET_Y + FOOTER_PAD_Y
+    row0_y = footer_top + FOOTER_PAD_Y + 6
+    row0b_y = row0_y + 42
+    row1_y = row0_y + 110
     row2_y = row1_y + 70 + 50
     row3_y = row2_y + 70
     row4_y = row3_y + 70
@@ -713,7 +727,80 @@ def add_footer(canvas: np.ndarray, current_res: int, footer_h: int | None = None
             row1_y += 30
             x = UI_MARGIN_LEFT
 
+    # Performance row (above RES)
+    x = UI_MARGIN_LEFT
+    perf_y = row0_y
+    max_w = canvas.shape[1] - UI_MARGIN_LEFT
+
+    def _perf_wrap(next_w: int) -> None:
+        nonlocal x, perf_y
+        if perf_y == row0_y and x + next_w > max_w:
+            perf_y = row0b_y
+            x = UI_MARGIN_LEFT
+    proc_idx = PROCESS_EVERY_OPTIONS.index(PROCESS_EVERY_N) if PROCESS_EVERY_N in PROCESS_EVERY_OPTIONS else 0
+    proc_rect = (x, perf_y + 20, x + 220, perf_y + 32)
+    _draw_slider(
+        canvas,
+        proc_rect,
+        proc_idx,
+        0,
+        len(PROCESS_EVERY_OPTIONS) - 1,
+        "PROC N",
+        str(PROCESS_EVERY_N),
+    )
+    UI_HITBOXES.append({"type": "slider_steps", "id": "process_every", "rect": proc_rect, "steps": PROCESS_EVERY_OPTIONS})
+    x += 220 + 40
+    _perf_wrap(200)
+
+    fps_idx = CAM_FPS_OPTIONS.index(CAMERA_FPS) if CAMERA_FPS in CAM_FPS_OPTIONS else 0
+    fps_rect = (x, perf_y + 20, x + 200, perf_y + 32)
+    _draw_slider(
+        canvas,
+        fps_rect,
+        fps_idx,
+        0,
+        len(CAM_FPS_OPTIONS) - 1,
+        "CAM FPS",
+        str(CAMERA_FPS),
+    )
+    UI_HITBOXES.append({"type": "slider_steps", "id": "cam_fps", "rect": fps_rect, "steps": CAM_FPS_OPTIONS})
+    x += 200 + 40
+    _perf_wrap(220)
+
+    cam_res_val = 0 if CAMERA_MATCH_MAXH else CAMERA_REQ_HEIGHT
+    cam_res_idx = CAM_RES_OPTIONS.index(cam_res_val) if cam_res_val in CAM_RES_OPTIONS else 0
+    cam_res_text = "AUTO" if cam_res_val == 0 else str(cam_res_val)
+    res_rect = (x, perf_y + 20, x + 220, perf_y + 32)
+    _draw_slider(
+        canvas,
+        res_rect,
+        cam_res_idx,
+        0,
+        len(CAM_RES_OPTIONS) - 1,
+        "CAM RES",
+        cam_res_text,
+    )
+    UI_HITBOXES.append({"type": "slider_steps", "id": "cam_res", "rect": res_rect, "steps": CAM_RES_OPTIONS})
+    # Force FOURCC + thread toggles into the second line for spacing.
+    perf_y = row0b_y
+    x = UI_MARGIN_LEFT
+
+    fourcc_btn = (x, perf_y + 16, x + 120, perf_y + 40)
+    _draw_button(canvas, fourcc_btn, f"FOURCC {CAMERA_FOURCC}", False, True)
+    UI_HITBOXES.append({"type": "button", "id": "cam_fourcc", "rect": fourcc_btn, "enabled": True})
+    x += 120 + 12
+
+    cam_thr_btn = (x, perf_y + 16, x + 90, perf_y + 40)
+    _draw_button(canvas, cam_thr_btn, "CAM THR", USE_CAMERA_THREAD, True)
+    UI_HITBOXES.append({"type": "toggle", "id": "cam_thread", "rect": cam_thr_btn, "enabled": True})
+    x += 90 + 8
+
+    rtsp_thr_btn = (x, perf_y + 16, x + 100, perf_y + 40)
+    _draw_button(canvas, rtsp_thr_btn, "RTSP THR", USE_RTSP_THREAD, True)
+    UI_HITBOXES.append({"type": "toggle", "id": "rtsp_thread", "rect": rtsp_thr_btn, "enabled": True})
+
     # RES buttons
+    x = UI_MARGIN_LEFT
     _draw_label(canvas, "RES (1-5)", x, row1_y - 6)
     for idx, res in enumerate(RES_OPTIONS):
         rect = (x, row1_y, x + 52, row1_y + btn_h)
@@ -905,6 +992,7 @@ def _apply_button_action(item: dict) -> None:
     global ENABLE_RTSP_INPUT, RTSP_URL
     global OSC_ENABLED
     global CAMERA_INDEX, CAMERA_INDEX_CHANGED
+    global CAMERA_FOURCC, USE_CAMERA_THREAD, USE_RTSP_THREAD
     item_id = item["id"]
     if item_id == "res":
         set_resolution_by_index(int(item["value"]))
@@ -996,6 +1084,30 @@ def _apply_button_action(item: dict) -> None:
         save_settings()
         UI_PENDING_SOURCE = "rtsp"
         return
+    if item_id == "cam_fourcc":
+        if CAMERA_FOURCC in CAM_FOURCC_OPTIONS:
+            idx = CAM_FOURCC_OPTIONS.index(CAMERA_FOURCC)
+            CAMERA_FOURCC = CAM_FOURCC_OPTIONS[(idx + 1) % len(CAM_FOURCC_OPTIONS)]
+        else:
+            CAMERA_FOURCC = CAM_FOURCC_OPTIONS[0]
+        save_settings()
+        if CURRENT_SOURCE == "camera":
+            CAMERA_INDEX_CHANGED = True
+            UI_PENDING_SOURCE = "camera"
+        return
+    if item_id == "cam_thread":
+        USE_CAMERA_THREAD = not USE_CAMERA_THREAD
+        save_settings()
+        if CURRENT_SOURCE == "camera":
+            CAMERA_INDEX_CHANGED = True
+            UI_PENDING_SOURCE = "camera"
+        return
+    if item_id == "rtsp_thread":
+        USE_RTSP_THREAD = not USE_RTSP_THREAD
+        save_settings()
+        if CURRENT_SOURCE == "rtsp":
+            UI_PENDING_SOURCE = "rtsp"
+        return
     if item_id == "osc_enabled":
         OSC_ENABLED = not OSC_ENABLED
         save_settings()
@@ -1043,6 +1155,8 @@ def _handle_text_input(key: int) -> bool:
 
 def _apply_slider_action(item: dict, x: int) -> None:
     global CURRENT_PEOPLE_LIMIT, BLUR_KERNEL_IDX, MASK_THRESH, IMG_SIZE_IDX
+    global PROCESS_EVERY_N, CAMERA_FPS, CAMERA_REQ_HEIGHT, CAMERA_REQ_WIDTH, CAMERA_MATCH_MAXH
+    global CAMERA_INDEX_CHANGED
     x1, _, x2, _ = item["rect"]
     if x2 <= x1:
         return
@@ -1054,7 +1168,34 @@ def _apply_slider_action(item: dict, x: int) -> None:
         steps = item["steps"]
         idx = int(round(ratio * (len(steps) - 1))) if steps else 0
         idx = max(0, min(idx, len(steps) - 1))
-        if item_id == "blur_kernel" and idx != BLUR_KERNEL_IDX:
+        if item_id == "process_every":
+            val = steps[idx]
+            if val != PROCESS_EVERY_N:
+                PROCESS_EVERY_N = val
+                save_settings()
+        elif item_id == "cam_fps":
+            val = steps[idx]
+            if val != CAMERA_FPS:
+                CAMERA_FPS = val
+                save_settings()
+                if CURRENT_SOURCE == "camera":
+                    CAMERA_INDEX_CHANGED = True
+                    globals()["UI_PENDING_SOURCE"] = "camera"
+        elif item_id == "cam_res":
+            val = steps[idx]
+            if val == 0:
+                CAMERA_MATCH_MAXH = True
+                CAMERA_REQ_HEIGHT = 0
+                CAMERA_REQ_WIDTH = 0
+            else:
+                CAMERA_MATCH_MAXH = False
+                CAMERA_REQ_HEIGHT = val
+                CAMERA_REQ_WIDTH = int(val * 16 / 9)
+            save_settings()
+            if CURRENT_SOURCE == "camera":
+                CAMERA_INDEX_CHANGED = True
+                globals()["UI_PENDING_SOURCE"] = "camera"
+        elif item_id == "blur_kernel" and idx != BLUR_KERNEL_IDX:
             BLUR_KERNEL_IDX = idx
             save_settings()
         elif item_id == "img_size" and idx != IMG_SIZE_IDX:
@@ -1185,6 +1326,8 @@ def on_mouse(event: int, x: int, y: int, flags: int, param: Any) -> None:
             return
 
     if event == cv2.EVENT_MOUSEWHEEL:
+        if not (flags & cv2.EVENT_FLAG_SHIFTKEY):
+            return
         if ROI_PANEL_BOUNDS_ABS is None:
             bx = by = bw = bh = None
         else:
@@ -1314,10 +1457,24 @@ def open_capture(source: str):
             print("[CAM] No hay cámaras disponibles.", file=sys.stderr)
             return None
         CAMERA_INDEX = picked
-        cap = cv2.VideoCapture(CAMERA_INDEX)
+        cap = _open_camera_cap(CAMERA_INDEX)
         if cap.isOpened():
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAP_WIDTH)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAP_HEIGHT)
+            req_w, req_h = _camera_request_size()
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, req_w)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, req_h)
+            if CAMERA_FPS:
+                cap.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
+            try:
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                pass
+            if CAMERA_FOURCC:
+                try:
+                    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*CAMERA_FOURCC))
+                except Exception:
+                    pass
+        if USE_CAMERA_THREAD:
+            return LatestFrameCapture(cap, grab_skip=CAMERA_GRAB_SKIP)
         return cap
     if source == "ndi":
         return NDIReceiver(source_name=NDI_PREFERRED_SOURCE)
@@ -1420,25 +1577,47 @@ def apply_source_change(new_source: str, cap):
     CURRENT_SOURCE = new_source
     if new_source == "video":
         CURRENT_VIDEO_INDEX = 0
-    release_capture(cap)
-    cap = open_capture(CURRENT_SOURCE)
-    if not capture_ready(cap):
+    new_cap = open_capture(CURRENT_SOURCE)
+    if not capture_ready(new_cap):
         print(f"No se pudo abrir la fuente {new_source}, se mantiene la anterior.", file=sys.stderr)
+        release_capture(new_cap)
         CURRENT_SOURCE = prev_src
-        cap = prev_cap
-    else:
-        save_settings()
-        CAMERA_INDEX_CHANGED = False
-    return cap
+        return prev_cap
+    release_capture(prev_cap)
+    save_settings()
+    CAMERA_INDEX_CHANGED = False
+    return new_cap
+
+
+def _camera_request_size() -> Tuple[int, int]:
+    if CAMERA_REQ_WIDTH > 0 and CAMERA_REQ_HEIGHT > 0:
+        return CAMERA_REQ_WIDTH, CAMERA_REQ_HEIGHT
+    if CAMERA_MATCH_MAXH and CURRENT_MAX_HEIGHT > 0:
+        req_h = CURRENT_MAX_HEIGHT
+        req_w = int(req_h * 16 / 9)
+        return req_w, req_h
+    return CAP_WIDTH, CAP_HEIGHT
+
+
+def _open_camera_cap(idx: int) -> cv2.VideoCapture:
+    try:
+        if sys.platform == "darwin":
+            return cv2.VideoCapture(idx, cv2.CAP_AVFOUNDATION)
+    except Exception:
+        pass
+    return cv2.VideoCapture(idx)
 
 
 def _probe_camera_index(idx: int) -> bool:
-    cap = cv2.VideoCapture(idx)
+    cap = _open_camera_cap(idx)
     ok = False
     try:
         if cap.isOpened():
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAP_WIDTH)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAP_HEIGHT)
+            req_w, req_h = _camera_request_size()
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, req_w)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, req_h)
+            if CAMERA_FPS:
+                cap.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
             ok = True
     except Exception:
         ok = False
@@ -1521,6 +1700,8 @@ def load_settings():
     global IMG_SIZE_IDX, HIGH_PRECISION_MODE, NDI_OUTPUT_MASK, CURRENT_SOURCE, SHOW_DETAIL, FLIP_INPUT
     global ENABLE_NDI_INPUT, ENABLE_NDI_OUTPUT, ENABLE_NDI_TRANSLATIONS_OUTPUT, ENABLE_RTSP_INPUT, RTSP_URL
     global OSC_IP, OSC_PORT, OSC_ENABLED
+    global PROCESS_EVERY_N, CAMERA_FPS, CAMERA_FOURCC, CAMERA_REQ_WIDTH, CAMERA_REQ_HEIGHT, CAMERA_MATCH_MAXH
+    global USE_CAMERA_THREAD, USE_RTSP_THREAD
     global CAMERA_INDEX
     try:
         import json
@@ -1617,6 +1798,40 @@ def load_settings():
         OSC_ENABLED = bool(data.get("osc_enabled", OSC_ENABLED))
     except Exception:
         pass
+    try:
+        val = int(data.get("process_every_n", PROCESS_EVERY_N))
+        if val in PROCESS_EVERY_OPTIONS:
+            PROCESS_EVERY_N = val
+    except Exception:
+        pass
+    try:
+        val = int(data.get("camera_fps", CAMERA_FPS))
+        if val in CAM_FPS_OPTIONS:
+            CAMERA_FPS = val
+    except Exception:
+        pass
+    try:
+        fourcc = str(data.get("camera_fourcc", CAMERA_FOURCC)).strip().upper()
+        if fourcc in CAM_FOURCC_OPTIONS:
+            CAMERA_FOURCC = fourcc
+    except Exception:
+        pass
+    try:
+        cam_res = int(data.get("camera_res_h", CAMERA_REQ_HEIGHT))
+        if cam_res in CAM_RES_OPTIONS:
+            CAMERA_REQ_HEIGHT = cam_res
+            CAMERA_REQ_WIDTH = int(cam_res * 16 / 9) if cam_res > 0 else 0
+            CAMERA_MATCH_MAXH = cam_res == 0
+    except Exception:
+        pass
+    try:
+        USE_CAMERA_THREAD = bool(data.get("camera_thread", USE_CAMERA_THREAD))
+    except Exception:
+        pass
+    try:
+        USE_RTSP_THREAD = bool(data.get("rtsp_thread", USE_RTSP_THREAD))
+    except Exception:
+        pass
 
 
 def save_settings(extra: dict[str, Any] | None = None):
@@ -1637,6 +1852,12 @@ def save_settings(extra: dict[str, Any] | None = None):
         "osc_ip": OSC_IP,
         "osc_port": OSC_PORT,
         "osc_enabled": OSC_ENABLED,
+        "process_every_n": PROCESS_EVERY_N,
+        "camera_fps": CAMERA_FPS,
+        "camera_fourcc": CAMERA_FOURCC,
+        "camera_res_h": CAMERA_REQ_HEIGHT if not CAMERA_MATCH_MAXH else 0,
+        "camera_thread": USE_CAMERA_THREAD,
+        "rtsp_thread": USE_RTSP_THREAD,
         "source": CURRENT_SOURCE,
         "show_detail": SHOW_DETAIL,
         "flip_input": FLIP_INPUT,
@@ -1760,6 +1981,14 @@ class LatestFrameCapture:
 
     def isOpened(self):
         return self.cap is not None and self.cap.isOpened()
+
+    def get(self, prop):
+        if self.cap is None:
+            return 0
+        try:
+            return self.cap.get(prop)
+        except Exception:
+            return 0
 
     def release(self):
         self.stop_event.set()
@@ -2115,6 +2344,15 @@ def main():
             if CURRENT_SOURCE == "video" and cap is not None:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 frame, got_new_frame = capture_frame(cap)
+            elif CURRENT_SOURCE == "camera":
+                release_capture(cap)
+                cap = open_capture("camera")
+                frame, got_new_frame = capture_frame(cap)
+                if frame is None:
+                    fallback_h = min(CURRENT_MAX_HEIGHT, IMG_SIZE_OPTIONS[IMG_SIZE_IDX])
+                    fallback_w = int(fallback_h * 16 / 9)
+                    frame = np.zeros((fallback_h, fallback_w, 3), dtype=np.uint8)
+                    got_new_frame = False
             elif CURRENT_SOURCE in {"ndi", "rtsp"}:
                 # Mantener último frame o negro mientras esperamos señal.
                 if last_frame is not None:
@@ -2469,8 +2707,11 @@ def main():
         res_text = f"{frame.shape[1]}x{frame.shape[0]}"
         people_count = len(boxes) if boxes is not None else 0
         cap_fps = None
-        if isinstance(cap, cv2.VideoCapture):
-            cap_fps = cap.get(cv2.CAP_PROP_FPS)
+        if hasattr(cap, "get"):
+            try:
+                cap_fps = cap.get(cv2.CAP_PROP_FPS)
+            except Exception:
+                cap_fps = None
         add_header(canvas, fps, DEVICE, res_text, people_count, source_label(), cap_fps=cap_fps)
 
         osc_now = time.time()
@@ -2517,6 +2758,7 @@ def main():
             HIGH_PRECISION_MODE,
             SHOW_DETAIL,
             FLIP_INPUT,
+            CURRENT_MODEL_KEY,
             CURRENT_SOURCE,
             bool(VIDEO_FILES),
             ENABLE_NDI,
@@ -2528,6 +2770,13 @@ def main():
             round(PERSIST_RISE_TAU, 3),
             round(PERSIST_FALL_TAU, 3),
             CAMERA_INDEX,
+            PROCESS_EVERY_N,
+            CAMERA_FPS,
+            CAMERA_FOURCC,
+            CAMERA_REQ_HEIGHT,
+            CAMERA_MATCH_MAXH,
+            USE_CAMERA_THREAD,
+            USE_RTSP_THREAD,
             OSC_IP,
             OSC_PORT,
             OSC_ENABLED,
