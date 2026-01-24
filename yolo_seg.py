@@ -1,2929 +1,945 @@
-"""
-Real-time human segmentation using YOLOv8 (segment task) with OpenCV.
-Pipeline: captura -> segmentación -> máscara -> composite.
-Ventana única 1280x720: vista original anotada (FPS + boxes) y máscara binaria.
+"""Minimal camera viewer.
+- Shows camera feed in a single window.
+- Press 'c' to cycle camera inputs.
+- Press 'q' to quit.
 """
 
 from __future__ import annotations
 
+import json
+import os
 import sys
 import time
-import math
-import threading
-import socket
-import struct
-from typing import Tuple, Any, Optional
-import os
-import multiprocessing as mp
 from pathlib import Path
-from fractions import Fraction
+from dataclasses import dataclass, field
+import threading
+from typing import Dict, Optional, Tuple
+
 import cv2
 import numpy as np
-import torch
 from ultralytics import YOLO
 
-# Configuración de rendimiento
-RES_OPTIONS = [160, 240, 320, 360, 480]  # opciones de altura máxima
-CURRENT_MAX_HEIGHT = 240  # valor inicial (se sobreescribe si hay guardado)
-IMG_SIZE_OPTIONS = [320, 480, 640]  # resoluciones de inferencia YOLO
-IMG_SIZE_IDX = 0  # índice inicial -> 320
-PROCESS_EVERY_N = max(1, int(os.environ.get("NEXT_PROCESS_EVERY_N", "2")))  # procesa 1 de cada N frames
-CAP_WIDTH = 640   # resolución solicitada a la cámara (puede ajustarse)
-CAP_HEIGHT = 480
-PROCESS_EVERY_OPTIONS = [1, 2, 3, 4]
-CAM_FPS_OPTIONS = [15, 30, 60]
-CAM_RES_OPTIONS = [0, 360, 480, 720]  # 0 => auto (match MAXH)
-CAM_FOURCC_OPTIONS = ["MJPG", "YUY2"]
-CAMERA_FPS = max(1, int(os.environ.get("NEXT_CAMERA_FPS", "60")))
-CAMERA_FOURCC = os.environ.get("NEXT_CAMERA_FOURCC", "MJPG").strip().upper()
-DEVICE = None
-RES_SAVE_FILE = Path(__file__).with_name("resolution.txt")
-MODEL_SAVE_FILE = Path(__file__).with_name("model.txt")
-MODEL_OPTIONS = {
-    ord("a"): ("yolov8n-seg.pt", "yolov8n-seg (rapido)"),
-    ord("s"): ("yolov8s-seg.pt", "yolov8s-seg (balance)"),
-    ord("d"): ("yolov8m-seg.pt", "yolov8m-seg (mas pesado)"),
-}
-CURRENT_MODEL_KEY = ord("a")
-CURRENT_MODEL_PATH = MODEL_OPTIONS[CURRENT_MODEL_KEY][0]
-PEOPLE_LIMIT_OPTIONS = list(range(1, 21))
-CURRENT_PEOPLE_LIMIT = 10
-def env_flag(name: str, default: bool = True) -> bool:
-    val = os.environ.get(name)
-    if val is None:
-        return default
-    return val.strip().lower() not in {"0", "false", "no", "off"}
-
-
-ENABLE_NDI = env_flag("NEXT_ENABLE_NDI", True)  # Permite desactivar NDI si está inestable
-ENABLE_NDI_INPUT = env_flag("NEXT_ENABLE_NDI_INPUT", True)
-ENABLE_NDI_OUTPUT = env_flag("NEXT_ENABLE_NDI_OUTPUT", True)  # Publicar máscara por NDI
-ENABLE_NDI_TRANSLATIONS_OUTPUT = env_flag("NEXT_ENABLE_NDI_TRANSLATIONS_OUTPUT", False)
-ENABLE_RTSP_INPUT = env_flag("NEXT_ENABLE_RTSP_INPUT", True)
-CAMERA_MATCH_MAXH = env_flag("NEXT_CAMERA_MATCH_MAXH", True)
-CAMERA_REQ_WIDTH = max(0, int(os.environ.get("NEXT_CAMERA_WIDTH", "0")))
-CAMERA_REQ_HEIGHT = max(0, int(os.environ.get("NEXT_CAMERA_HEIGHT", "0")))
-CAMERA_MAX_INDEX = max(0, int(os.environ.get("NEXT_CAMERA_MAX_INDEX", "3")))
-CAMERA_INDEX = max(0, min(int(os.environ.get("NEXT_CAMERA_INDEX", "0")), CAMERA_MAX_INDEX))
-CAMERA_INDEX_CHANGED = False
-RTSP_URL = os.environ.get(
-    "NEXT_RTSP_URL",
-    "rtsp://192.168.0.215:5543/c9fa2e29ba99618fc28088ccae18076b/live/channel0",
-).strip()
-RTSP_TRANSPORT = os.environ.get("NEXT_RTSP_TRANSPORT", "udp").strip().lower()
-RTSP_RECONNECT_SEC = float(os.environ.get("NEXT_RTSP_RECONNECT_SEC", "2.0"))
-RTSP_GRAB_SKIP = max(0, int(os.environ.get("NEXT_RTSP_GRAB_SKIP", "0")))
-USE_RTSP_THREAD = env_flag("NEXT_RTSP_THREAD", True)
-USE_CAMERA_THREAD = env_flag("NEXT_CAMERA_THREAD", True)
-CAMERA_GRAB_SKIP = max(0, int(os.environ.get("NEXT_CAMERA_GRAB_SKIP", "0")))
-DATA_DIR = Path(__file__).with_name("DATA")
-VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv"}
-VIDEO_FILES = sorted([p for p in DATA_DIR.glob("*") if p.suffix.lower() in VIDEO_EXTS])
-DEFAULT_SOURCE = "camera"  # se ajusta en runtime tras probar NDI
-CURRENT_SOURCE = DEFAULT_SOURCE  # "camera", "video", "ndi" o "rtsp"
-CURRENT_VIDEO_INDEX = 0
-NDI_PREFERRED_SOURCE = "MadMapper"
-BLUR_KERNEL_OPTIONS = [1, 3, 5, 7, 9, 11, 13]
-BLUR_KERNEL_IDX = 2  # valor inicial -> kernel 5
-MASK_THRESH = 127
-BLUR_ENABLED = True
-HIGH_PRECISION_MODE = False  # modo alta precisión (imgsz alto y sin blur en mask_detail)
-PERSIST_HOLD_SEC = 0.35  # segundos para mantener silueta tras perder detección
-PERSIST_RISE_TAU = 0.12  # segundos para fade-in
-PERSIST_FALL_TAU = 0.25  # segundos para fade-out
-FOOTER_GAP_PX = 40  # separación entre vistas y GUI inferior
-FOOTER_UI_OFFSET_Y = 40  # baja el GUI dentro del footer
-UI_MARGIN_LEFT = 20  # margen izquierdo para textos y GUI
-VIEW_LABEL_H = 24  # altura del label sobre cada vista
-VIEW_OFFSET_Y = 20  # baja las vistas (label + imagen) dentro del canvas
-CANVAS_WIDTH = 1536
-CANVAS_HEIGHT = 980  # extra altura para GUI inferior
-NDI_TR_OUTPUT_W = 1080
-NDI_TR_OUTPUT_H = 1920
-UI_BG_COLOR = (30, 30, 30)
-VIEW_BG_COLOR = (0, 0, 0)
-RIGHT_PANEL_BG_COLOR = (45, 45, 45)
-ROI_WORK_BG_COLOR = (0, 0, 0)
-RIGHT_PANEL_FOOTER_H = 70  # espacio bajo la tercera ventana para botones
-RIGHT_PANEL_MARGIN_X = 20
-RIGHT_PANEL_ROW_GAP = 10
-FIT_CACHE = {}
-FIT_CACHE_ORDER = []
-FIT_CACHE_MAX = 6
-USE_INFERENCE_THREAD = True
-VIEW_HITBOXES = []
-ACTIVE_VIEW_TAB = "mask"
-ROI_LIST = []
-ROI_ACTIVE_IDX = None
-ROI_DRAG_OFFSET = (0, 0)
-ROI_PANEL_BOUNDS = None  # (w, h) for right panel image area (local)
-ROI_PANEL_BOUNDS_ABS = None  # (x0, y0, w, h) absolute for mouse
-ROI_MAX = 10
-ROI_STATE = []  # per-ROI assignment state (centroids/persistence)
-ROI_DIRTY = False
-
-MASK_ROI_LIST = []
-MASK_ROI_ACTIVE_IDX = None
-MASK_ROI_DRAG_OFFSET = (0, 0)
-MASK_ROI_PANEL_BOUNDS = None  # (w, h) for mask panel image area (local)
-MASK_ROI_PANEL_BOUNDS_ABS = None  # (x0, y0, w, h) absolute for mouse
-MASK_ROI_DIRTY = False
-MASK_PANEL_FIT = None  # (scale, x_off, y_off, new_w, new_h, src_w, src_h)
-
-# OSC settings + UI state
-OSC_IP = "127.0.0.1"
-OSC_PORT = 9000
-OSC_ENABLED = False
-OSC_SEND_HZ = 20.0
-OSC_SEND_INTERVAL = 1.0 / OSC_SEND_HZ
-UI_ACTIVE_TEXT = None
-UI_TEXT_BUFFER = ""
-
-# UI state (footer GUI)
-UI_HITBOXES = []
-UI_ACTIVE_SLIDER = None
-UI_PENDING_MODEL_KEY = None
-UI_PENDING_SOURCE = None
-NDI_OUTPUT_MASK = "soft"  # "soft" o "detail"
-FOOTER_CACHE = None
-FOOTER_CACHE_KEY = None
-FOOTER_CACHE_HITBOXES = []
-FOOTER_PAD_Y = 10
-FOOTER_HEIGHT = 560
-SHOW_DETAIL_DEFAULT = False
-SHOW_DETAIL = SHOW_DETAIL_DEFAULT
-FLIP_INPUT = False
-
-# --------------- utils de captura y redimensionado -----------------
-def resize_keep_aspect(frame, max_height: int = 480):
-    """Resize frame to a max height, preserving aspect ratio."""
-    h, w = frame.shape[:2]
-    if h <= max_height:
-        return frame
-    scale = max_height / float(h)
-    new_size: Tuple[int, int] = (int(w * scale), int(h * scale))
-    return cv2.resize(frame, new_size, interpolation=cv2.INTER_AREA)
-
-
-def maybe_flip_input(frame: np.ndarray) -> np.ndarray:
-    if not FLIP_INPUT:
-        return frame
-    return cv2.flip(frame, 1)
-
-
-def capture_frame(cap: cv2.VideoCapture):
-    """Capture and resize a frame; returns (frame, is_new)."""
-    if cap is None:
-        return None, False
-    if hasattr(cap, "read_latest"):
-        frame, is_new = cap.read_latest()
-        if frame is None:
-            return None, False
-        frame = resize_keep_aspect(frame, max_height=CURRENT_MAX_HEIGHT)
-        return maybe_flip_input(frame), is_new
-    if isinstance(cap, NDIReceiver):
-        frame = cap.capture()
-        if frame is None:
-            return None, False
-        # Para NDI, limitamos a la resolución de entrada seleccionada (altura) y al imgsz actual.
-        target_h = min(CURRENT_MAX_HEIGHT, IMG_SIZE_OPTIONS[IMG_SIZE_IDX])
-        if HIGH_PRECISION_MODE:
-            target_h = max(target_h, IMG_SIZE_OPTIONS[-1])
-        frame = resize_keep_aspect(frame, max_height=target_h)
-        return maybe_flip_input(frame), True
-    ok, frame = cap.read()
-    if not ok:
-        return None, False
-    frame = resize_keep_aspect(frame, max_height=CURRENT_MAX_HEIGHT)
-    return maybe_flip_input(frame), True
-
-
-# --------------- segmentación --------------------------------------
-def segment_people(
-    frame: np.ndarray,
-    model: YOLO,
-    people_limit: int,
-    mask_thresh: int,
-    blur_enabled: bool,
-    compute_person_masks: bool = True,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, list]:
-    """
-    Run YOLOv8 segmentation and return:
-    - mask_soft: smoothed binary mask (uint8) suitable for NDI/output.
-    - mask_detail: sharper binary mask (uint8) preserving fine contours.
-    - boxes: ndarray of person boxes (N, 4) in xyxy format.
-    mask_detail generation:
-      * Resize masks with linear interpolation for smoother edges.
-      * Aggregate per-pixel max over persons (filtered by limit).
-      * Optional light morphology to clean speckles.
-      * Threshold with user-defined value.
-    mask_soft generation:
-      * Derived from mask_detail, optional Gaussian blur, re-threshold, optional light closing.
-    """
-    h, w = frame.shape[:2]
-    imgsz = max(IMG_SIZE_OPTIONS) if HIGH_PRECISION_MODE else IMG_SIZE_OPTIONS[IMG_SIZE_IDX]
-    with torch.inference_mode():
-        result = model(frame, imgsz=imgsz, verbose=False, device=DEVICE)[0]
-
-    # If the model returns no masks, bail early.
-    if result.masks is None or result.boxes is None:
-        empty = np.zeros((h, w), dtype=np.uint8)
-        return empty, empty, np.empty((0, 4)), []
-
-    masks = result.masks.data.cpu().numpy()  # shape: (N, H, W) in model space
-    classes = result.boxes.cls.cpu().numpy().astype(int)  # shape: (N,)
-    boxes_all = result.boxes.xyxy.cpu().numpy()
-    confs = result.boxes.conf.cpu().numpy()
-
-    # Filtrar solo personas y aplicar límite ordenando por confianza.
-    person_indices = [i for i, cls_id in enumerate(classes) if cls_id == 0]
-    if not person_indices:
-        empty = np.zeros((h, w), dtype=np.uint8)
-        return empty, empty, np.empty((0, 4)), []
-    person_indices = sorted(person_indices, key=lambda i: confs[i], reverse=True)[:people_limit]
-
-    # Aggregate soft mask (float) to keep fine contours before thresholding.
-    person_mask = np.zeros((h, w), dtype=np.float32)
-    person_masks = [] if compute_person_masks else None
-    person_boxes = []
-    for idx in person_indices:
-        m = masks[idx]
-        # Resize mask from model space to frame space; keep float precision for later threshold.
-        m_resized = cv2.resize(m, (w, h), interpolation=cv2.INTER_LINEAR)
-        person_mask = np.maximum(person_mask, m_resized)
-        if compute_person_masks:
-            person_masks.append(m_resized)
-        person_boxes.append(boxes_all[idx])
-
-    # Convert to uint8 scale 0-255 for morphology/thresholding.
-    person_mask_u8 = np.clip(person_mask * 255.0, 0, 255).astype(np.uint8)
-
-    # Morphology to clean speckles while preserving contour.
-    morph_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    person_mask_u8 = cv2.morphologyEx(person_mask_u8, cv2.MORPH_OPEN, morph_kernel, iterations=1)
-    person_mask_u8 = cv2.morphologyEx(person_mask_u8, cv2.MORPH_CLOSE, morph_kernel, iterations=1)
-
-    # mask_detail: threshold with minimal blur (none by default).
-    mask_detail = person_mask_u8.copy()
-    _, mask_detail = cv2.threshold(mask_detail, mask_thresh, 255, cv2.THRESH_BINARY)
-
-    # mask_soft: derived from mask_detail, optional blur + closing to smooth edges.
-    mask_soft = mask_detail.copy()
-    ksize = BLUR_KERNEL_OPTIONS[BLUR_KERNEL_IDX]
-    if blur_enabled and ksize > 1:
-        mask_soft = cv2.GaussianBlur(mask_soft, (ksize, ksize), 0)
-        _, mask_soft = cv2.threshold(mask_soft, mask_thresh, 255, cv2.THRESH_BINARY)
-    # Light closing to reduce jaggies without over-rounding.
-    mask_soft = cv2.morphologyEx(mask_soft, cv2.MORPH_CLOSE, morph_kernel, iterations=1)
-
-    person_masks_soft = []
-    if compute_person_masks and person_masks:
-        for m in person_masks:
-            m_u8 = np.clip(m * 255.0, 0, 255).astype(np.uint8)
-            _, m_u8 = cv2.threshold(m_u8, mask_thresh, 255, cv2.THRESH_BINARY)
-            if ksize > 1:
-                m_u8 = cv2.GaussianBlur(m_u8, (ksize, ksize), 0)
-                _, m_u8 = cv2.threshold(m_u8, mask_thresh, 255, cv2.THRESH_BINARY)
-            m_u8 = cv2.morphologyEx(m_u8, cv2.MORPH_CLOSE, morph_kernel, iterations=1)
-            person_masks_soft.append(m_u8)
-    return mask_soft, mask_detail, np.array(person_boxes), person_masks_soft
-
-
-# --------------- composición y overlays ----------------------------
-def make_composite(frame: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """Return black background with white silhouettes."""
-    composite = np.zeros_like(frame)
-    composite[mask > 0] = (255, 255, 255)
-    return composite
-
-
-def fit_to_box(image: np.ndarray, box_size: Tuple[int, int]) -> np.ndarray:
-    """Resize image to fit inside box_size keeping aspect ratio; no extra padding if width matches."""
-    box_w, box_h = box_size
-    h, w = image.shape[:2]
-    cache_key = (id(image), box_w, box_h, w, h)
-    cached = FIT_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
-    scale = min(box_w / w, box_h / h)
-    new_size = (max(1, int(w * scale)), max(1, int(h * scale)))
-    resized = cv2.resize(image, new_size, interpolation=cv2.INTER_AREA)
-
-    if new_size[0] == box_w:
-        # Height is already within box_h; crop if needed to avoid left padding.
-        if new_size[1] > box_h:
-            resized = resized[0:box_h, 0:box_w]
-        canvas = np.zeros((box_h, box_w, 3), dtype=np.uint8)
-        canvas[0 : resized.shape[0], 0 : resized.shape[1]] = resized
-        FIT_CACHE[cache_key] = canvas
-        FIT_CACHE_ORDER.append(cache_key)
-        if len(FIT_CACHE_ORDER) > FIT_CACHE_MAX:
-            old_key = FIT_CACHE_ORDER.pop(0)
-            FIT_CACHE.pop(old_key, None)
-        return canvas
-
-    canvas = np.zeros((box_h, box_w, 3), dtype=np.uint8)
-    y_off = 0  # align to top
-    x_off = (box_w - new_size[0]) // 2
-    canvas[y_off : y_off + new_size[1], x_off : x_off + new_size[0]] = resized
-    FIT_CACHE[cache_key] = canvas
-    FIT_CACHE_ORDER.append(cache_key)
-    if len(FIT_CACHE_ORDER) > FIT_CACHE_MAX:
-        old_key = FIT_CACHE_ORDER.pop(0)
-        FIT_CACHE.pop(old_key, None)
-    return canvas
-
-
-def add_overlay(image: np.ndarray, label: str) -> np.ndarray:
-    """Backwards-compatible wrapper (deprecated)."""
-    overlay = image.copy()
-    cv2.putText(overlay, label, (UI_MARGIN_LEFT, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-    return overlay
-
-
-def make_labeled_view(image: np.ndarray, label: str, box_size: Tuple[int, int]) -> np.ndarray:
-    """Place label above the image; image is fitted below the label strip."""
-    box_w, box_h = box_size
-    label_h = min(VIEW_LABEL_H, max(16, box_h // 6))
-    view = np.full((box_h, box_w, 3), VIEW_BG_COLOR, dtype=np.uint8)
-    cv2.rectangle(view, (0, 0), (box_w - 1, label_h), UI_BG_COLOR, -1)
-    cv2.putText(view, label, (UI_MARGIN_LEFT, label_h - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (235, 235, 235), 1)
-    if box_h - label_h > 0:
-        fitted = fit_to_box(image, (box_w, box_h - label_h))
-        view[label_h : label_h + fitted.shape[0], 0 : fitted.shape[1]] = fitted
-    return view
-
-
-def make_tabbed_view(
-    image: np.ndarray, box_size: Tuple[int, int], tabs: Tuple[Tuple[str, str], ...], active_key: str
-) -> Tuple[np.ndarray, list]:
-    """Create a view with a tab bar on top; returns view and tab rects (relative)."""
-    box_w, box_h = box_size
-    label_h = min(VIEW_LABEL_H, max(16, box_h // 6))
-    view = np.full((box_h, box_w, 3), VIEW_BG_COLOR, dtype=np.uint8)
-    cv2.rectangle(view, (0, 0), (box_w - 1, label_h), UI_BG_COLOR, -1)
-
-    tab_rects = []
-    x = UI_MARGIN_LEFT
-    for key, label in tabs:
-        text_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
-        tab_w = max(70, text_size[0] + 20)
-        rect = (x, 2, min(x + tab_w, box_w - 4), label_h - 2)
-        is_active = key == active_key
-        fill = (70, 70, 70) if is_active else (45, 45, 45)
-        cv2.rectangle(view, (rect[0], rect[1]), (rect[2], rect[3]), fill, -1)
-        cv2.rectangle(view, (rect[0], rect[1]), (rect[2], rect[3]), (90, 90, 90), 1)
-        ty = rect[1] + (rect[3] - rect[1] + text_size[1]) // 2
-        tx = rect[0] + (rect[2] - rect[0] - text_size[0]) // 2
-        cv2.putText(view, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (235, 235, 235), 1)
-        tab_rects.append((key, rect))
-        x = rect[2] + 8
-
-    if box_h - label_h > 0:
-        fitted = fit_to_box(image, (box_w, box_h - label_h))
-        view[label_h : label_h + fitted.shape[0], 0 : fitted.shape[1]] = fitted
-    return view, tab_rects
-
-
-def _roi_rect(roi: dict) -> Tuple[int, int, int, int]:
-    half = int(roi["half"])
-    cx = int(roi["cx"])
-    cy = int(roi["cy"])
-    return cx - half, cy - half, cx + half, cy + half
-
-
-def _clamp_roi(roi: dict, w: int, h: int) -> None:
-    half = max(20, int(roi["half"]))
-    max_half = max(20, min(w, h) // 2)
-    half = min(half, max_half)
-    cx = int(roi["cx"])
-    cy = int(roi["cy"])
-    cx = max(half, min(w - half, cx))
-    cy = max(half, min(h - half, cy))
-    roi["half"] = half
-    roi["cx"] = cx
-    roi["cy"] = cy
-
-
-def add_roi() -> None:
-    global ROI_LIST, ROI_DIRTY
-    if ROI_PANEL_BOUNDS is None or len(ROI_LIST) >= ROI_MAX:
-        return
-    w, h = ROI_PANEL_BOUNDS
-    half = max(20, min(w, h) // 6)
-    roi = {"cx": w // 2, "cy": h // 2, "half": half}
-    _clamp_roi(roi, w, h)
-    ROI_LIST.append(roi)
-    ROI_DIRTY = True
-
-
-def add_mask_roi() -> None:
-    global MASK_ROI_LIST, MASK_ROI_DIRTY
-    if MASK_ROI_PANEL_BOUNDS is None or len(MASK_ROI_LIST) >= ROI_MAX:
-        return
-    w, h = MASK_ROI_PANEL_BOUNDS
-    half = max(20, min(w, h) // 6)
-    roi = {"cx": w // 2, "cy": h // 2, "half": half}
-    _clamp_roi(roi, w, h)
-    MASK_ROI_LIST.append(roi)
-    MASK_ROI_DIRTY = True
-
-
-def mask_rois_to_masks(mask: np.ndarray) -> list[np.ndarray]:
-    if not MASK_ROI_LIST or MASK_PANEL_FIT is None:
-        return []
-    scale, x_off, y_off, new_w, new_h, src_w, src_h = MASK_PANEL_FIT
-    if scale <= 0:
-        return []
-    masks = []
-    for roi in MASK_ROI_LIST:
-        x1, y1, x2, y2 = _roi_rect(roi)
-        disp_x1 = max(0, min(new_w, x1 - x_off))
-        disp_y1 = max(0, min(new_h, y1 - y_off))
-        disp_x2 = max(0, min(new_w, x2 - x_off))
-        disp_y2 = max(0, min(new_h, y2 - y_off))
-        if disp_x2 <= disp_x1 or disp_y2 <= disp_y1:
-            masks.append(np.zeros_like(mask))
-            continue
-        src_x1 = max(0, min(src_w, int(disp_x1 / scale)))
-        src_y1 = max(0, min(src_h, int(disp_y1 / scale)))
-        src_x2 = max(0, min(src_w, int(disp_x2 / scale)))
-        src_y2 = max(0, min(src_h, int(disp_y2 / scale)))
-        roi_mask = np.zeros_like(mask)
-        if src_x2 > src_x1 and src_y2 > src_y1:
-            roi_mask[src_y1:src_y2, src_x1:src_x2] = mask[src_y1:src_y2, src_x1:src_x2]
-        masks.append(roi_mask)
-    return masks
-
-
-def translate_masks_to_rois(
-    masks: list, roi_list: list, roi_size: Tuple[int, int], now: float, dt: float
-) -> np.ndarray:
-    """Place each mask into a ROI (one per ROI) with stable assignment and fade."""
-    w, h = roi_size
-    out = np.zeros((h, w), dtype=np.uint8)
-    if not masks or not roi_list:
-        return out
-
-    global ROI_STATE
-    if len(ROI_STATE) != len(roi_list):
-        ROI_STATE = [
-            {"centroid": None, "persist_mask": None, "last_detect_time": None, "last_detect_mask": None}
-            for _ in roi_list
-        ]
-
-    mask_info = []
-    for m in masks:
-        if m is None or not np.any(m):
-            continue
-        ys, xs = np.where(m > 0)
-        if ys.size == 0 or xs.size == 0:
-            continue
-        cx = int(xs.mean())
-        cy = int(ys.mean())
-        mask_info.append((m, (cx, cy)))
-    if not mask_info:
-        return out
-
-    mask_info.sort(key=lambda item: item[1][0])
-    unused = set(range(len(mask_info)))
-    assign = [None] * len(roi_list)
-    dist_thresh = max(30, min(w, h) // 10)
-
-    for i, state in enumerate(ROI_STATE):
-        if state["centroid"] is None:
-            continue
-        best = None
-        best_d = None
-        for idx in list(unused):
-            _, (cx, cy) = mask_info[idx]
-            pcx, pcy = state["centroid"]
-            d = (cx - pcx) ** 2 + (cy - pcy) ** 2
-            if best_d is None or d < best_d:
-                best_d = d
-                best = idx
-        if best is not None and best_d is not None and best_d <= dist_thresh * dist_thresh:
-            assign[i] = best
-            unused.remove(best)
-
-    for i in range(len(roi_list)):
-        if assign[i] is None and unused:
-            assign[i] = min(unused)
-            unused.remove(assign[i])
-
-    for roi_idx, mask_idx in enumerate(assign):
-        if mask_idx is None:
-            empty = np.zeros((h, w), dtype=np.uint8)
-            state = ROI_STATE[roi_idx]
-            persist_mask, last_time, last_mask = update_persistent_mask(
-                state["persist_mask"], empty, state["last_detect_time"], state["last_detect_mask"], now, dt
-            )
-            state["persist_mask"] = persist_mask
-            state["last_detect_time"] = last_time
-            state["last_detect_mask"] = last_mask
-            out = np.maximum(out, np.clip(persist_mask * 255.0, 0, 255).astype(np.uint8))
-            continue
-        m, centroid = mask_info[mask_idx]
-        ys, xs = np.where(m > 0)
-        x1, x2 = xs.min(), xs.max()
-        y1, y2 = ys.min(), ys.max()
-        crop = m[y1 : y2 + 1, x1 : x2 + 1]
-        ch, cw = crop.shape[:2]
-        if ch < 2 or cw < 2:
-            continue
-        roi = roi_list[roi_idx]
-        half = int(roi["half"])
-        roi_w = half * 2
-        roi_h = half * 2
-        scale = min(roi_w / float(cw), roi_h / float(ch), 1.0)
-        if scale < 1.0:
-            new_w = max(2, int(cw * scale))
-            new_h = max(2, int(ch * scale))
-            crop = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_AREA)
-            ch, cw = crop.shape[:2]
-
-        state = ROI_STATE[roi_idx]
-        state["centroid"] = centroid
-
-        dest_x1 = roi["cx"] - (cw // 2)
-        dest_y1 = roi["cy"] - (ch // 2)
-        roi_x1 = roi["cx"] - half
-        roi_y1 = roi["cy"] - half
-        roi_x2 = roi["cx"] + half
-        roi_y2 = roi["cy"] + half
-        dest_x1 = max(roi_x1, min(roi_x2 - cw, dest_x1))
-        dest_y1 = max(roi_y1, min(roi_y2 - ch, dest_y1))
-        dest_x2 = min(dest_x1 + cw, w)
-        dest_y2 = min(dest_y1 + ch, h)
-        src_w = dest_x2 - dest_x1
-        src_h = dest_y2 - dest_y1
-        if src_w <= 0 or src_h <= 0:
-            continue
-
-        placed = np.zeros((h, w), dtype=np.uint8)
-        placed[dest_y1:dest_y2, dest_x1:dest_x2] = crop[:src_h, :src_w]
-        persist_mask, last_time, last_mask = update_persistent_mask(
-            state["persist_mask"], placed, state["last_detect_time"], state["last_detect_mask"], now, dt
-        )
-        state["persist_mask"] = persist_mask
-        state["last_detect_time"] = last_time
-        state["last_detect_mask"] = last_mask
-        out = np.maximum(out, np.clip(persist_mask * 255.0, 0, 255).astype(np.uint8))
-    return out
-
-
-def update_persistent_mask(
-    persist_mask: Optional[np.ndarray],
-    mask_binary: np.ndarray,
-    last_detect_time: Optional[float],
-    last_detect_mask: Optional[np.ndarray],
-    now: float,
-    dt: float,
-) -> Tuple[np.ndarray, Optional[float], Optional[np.ndarray]]:
-    """Temporal smoothing + hold to reduce flicker; returns float mask in [0,1]."""
-    if persist_mask is None or persist_mask.shape != mask_binary.shape:
-        persist_mask = np.zeros(mask_binary.shape, dtype=np.float32)
-        last_detect_mask = None
-
-    has_detection = np.any(mask_binary > 0)
-    if has_detection:
-        last_detect_time = now
-        last_detect_mask = (mask_binary > 0).astype(np.float32)
-
-    if last_detect_mask is not None and last_detect_mask.shape != persist_mask.shape:
-        last_detect_mask = None
-    if last_detect_time is not None and (now - last_detect_time) <= PERSIST_HOLD_SEC:
-        target_on = last_detect_mask if last_detect_mask is not None else np.zeros_like(persist_mask)
-    else:
-        target_on = np.zeros_like(persist_mask)
-
-    rise_rate = 1.0 - math.exp(-dt / max(PERSIST_RISE_TAU, 1e-6))
-    fall_rate = 1.0 - math.exp(-dt / max(PERSIST_FALL_TAU, 1e-6))
-
-    on_mask = target_on > 0.0
-    persist_mask[on_mask] = (1.0 - rise_rate) * persist_mask[on_mask] + rise_rate * 1.0
-    persist_mask[~on_mask] = (1.0 - fall_rate) * persist_mask[~on_mask]
-    return persist_mask, last_detect_time, last_detect_mask
-
-
-def draw_boxes(frame: np.ndarray, boxes: np.ndarray) -> np.ndarray:
-    """Draw bounding boxes on the frame."""
-    out = frame.copy()
-    if boxes is None:
-        return out
-    for box in boxes:
-        x1, y1, x2, y2 = box.astype(int)
-        cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 255), 2)
-    return out
-
-
-def add_header(
-    canvas: np.ndarray,
-    fps: float,
-    device: str,
-    res_text: str,
-    people_count: int,
-    source_label: str,
-    cap_fps: float | None = None,
-) -> None:
-    """Draw a single header line with source, resolution, FPS, device, model and people count at the top of the canvas."""
-    current_model_label = MODEL_OPTIONS.get(CURRENT_MODEL_KEY, (CURRENT_MODEL_PATH, CURRENT_MODEL_PATH))[1]
-    fps_str = f"{fps:06.1f}"  # ancho fijo para evitar saltos en el texto
-    cap_fps_text = f"{cap_fps:0.1f}" if cap_fps is not None and cap_fps > 0 else "n/a"
-    text = (
-        f"SRC: {source_label} | RES: {res_text} | MAXH: {CURRENT_MAX_HEIGHT} | FPS: {fps_str} | "
-        f"CAP_FPS: {cap_fps_text} | GPU: {device} | MODEL: {current_model_label} | "
-        f"PEOPLE NOW: {people_count} | PREC: {'HIGH' if HIGH_PRECISION_MODE else 'NORM'}"
-    )
-    font_scale = 0.5
-    max_w = canvas.shape[1] - UI_MARGIN_LEFT - 10
-    render_text = text
-    while True:
-        size, _ = cv2.getTextSize(render_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)
-        if size[0] <= max_w or len(render_text) <= 8:
-            break
-        render_text = render_text[:-4] + "..."
-    cv2.putText(canvas, render_text, (UI_MARGIN_LEFT, 25), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 1)
-
-
-def _draw_label(canvas: np.ndarray, text: str, x: int, y: int) -> None:
-    cv2.putText(canvas, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1)
-
-
-def _draw_button(canvas: np.ndarray, rect: Tuple[int, int, int, int], text: str, active: bool, enabled: bool) -> None:
-    x1, y1, x2, y2 = rect
-    if not enabled:
-        fill = (40, 40, 40)
-        text_color = (120, 120, 120)
-    else:
-        fill = (70, 120, 70) if active else (60, 60, 60)
-        text_color = (235, 235, 235)
-    cv2.rectangle(canvas, (x1, y1), (x2, y2), fill, -1)
-    cv2.rectangle(canvas, (x1, y1), (x2, y2), (90, 90, 90), 1)
-    text_size, _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
-    tx = x1 + max(4, (x2 - x1 - text_size[0]) // 2)
-    ty = y1 + (y2 - y1 + text_size[1]) // 2
-    cv2.putText(canvas, text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.45, text_color, 1)
-
-
-def _draw_slider(
-    canvas: np.ndarray,
-    rect: Tuple[int, int, int, int],
-    value: float,
-    min_val: float,
-    max_val: float,
-    label: str,
-    value_text: str,
-) -> None:
-    x1, y1, x2, y2 = rect
-    _draw_label(canvas, label, x1, y1 - 6)
-    cv2.rectangle(canvas, (x1, y1), (x2, y2), (50, 50, 50), -1)
-    cv2.rectangle(canvas, (x1, y1), (x2, y2), (90, 90, 90), 1)
-    if max_val > min_val:
-        ratio = (value - min_val) / float(max_val - min_val)
-    else:
-        ratio = 0.0
-    ratio = max(0.0, min(1.0, ratio))
-    knob_x = x1 + int(ratio * (x2 - x1))
-    knob_y = (y1 + y2) // 2
-    cv2.circle(canvas, (knob_x, knob_y), 6, (190, 190, 190), -1)
-    cv2.putText(canvas, value_text, (x2 + 8, y2 + 1), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1)
-
-
-def add_footer(canvas: np.ndarray, current_res: int, footer_h: int | None = None, footer_top: int | None = None) -> None:
-    """Draw footer GUI with mouse-interactive controls."""
-    global UI_HITBOXES
-    UI_HITBOXES = []
-    if footer_h is None:
-        footer_h = FOOTER_HEIGHT
-    if footer_top is None:
-        footer_top = canvas.shape[0] - footer_h
-    cv2.rectangle(canvas, (0, footer_top), (canvas.shape[1], canvas.shape[0]), UI_BG_COLOR, -1)
-
-    row0_y = footer_top + FOOTER_PAD_Y + 6
-    row0b_y = row0_y + 42
-    row1_y = row0_y + 110
-    row2_y = row1_y + 70 + 50
-    row3_y = row2_y + 70
-    row4_y = row3_y + 70
-    row5_y = row4_y + 70
-    btn_h = 24
-    gap = 8
-    x = UI_MARGIN_LEFT
-    max_w = canvas.shape[1] - UI_MARGIN_LEFT
-
-    def _draw_text_input(rect: Tuple[int, int, int, int], label: str, text: str, active: bool) -> None:
-        x1, y1, x2, y2 = rect
-        _draw_label(canvas, label, x1, y1 - 6)
-        fill = (70, 70, 70) if active else (50, 50, 50)
-        cv2.rectangle(canvas, (x1, y1), (x2, y2), fill, -1)
-        cv2.rectangle(canvas, (x1, y1), (x2, y2), (90, 90, 90), 1)
-        display = text + ("_" if active else "")
-        cv2.putText(canvas, display[:24], (x1 + 6, y2 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (235, 235, 235), 1)
-
-    def _wrap_if_needed(next_w: int) -> None:
-        nonlocal x, row1_y
-        if x + next_w > max_w:
-            row1_y += 30
-            x = UI_MARGIN_LEFT
-
-    # Performance row (above RES)
-    x = UI_MARGIN_LEFT
-    perf_y = row0_y
-    max_w = canvas.shape[1] - UI_MARGIN_LEFT
-
-    def _perf_wrap(next_w: int) -> None:
-        nonlocal x, perf_y
-        if perf_y == row0_y and x + next_w > max_w:
-            perf_y = row0b_y
-            x = UI_MARGIN_LEFT
-    proc_idx = PROCESS_EVERY_OPTIONS.index(PROCESS_EVERY_N) if PROCESS_EVERY_N in PROCESS_EVERY_OPTIONS else 0
-    proc_rect = (x, perf_y + 20, x + 220, perf_y + 32)
-    _draw_slider(
-        canvas,
-        proc_rect,
-        proc_idx,
-        0,
-        len(PROCESS_EVERY_OPTIONS) - 1,
-        "PROC N",
-        str(PROCESS_EVERY_N),
-    )
-    UI_HITBOXES.append({"type": "slider_steps", "id": "process_every", "rect": proc_rect, "steps": PROCESS_EVERY_OPTIONS})
-    x += 220 + 40
-    _perf_wrap(200)
-
-    fps_idx = CAM_FPS_OPTIONS.index(CAMERA_FPS) if CAMERA_FPS in CAM_FPS_OPTIONS else 0
-    fps_rect = (x, perf_y + 20, x + 200, perf_y + 32)
-    _draw_slider(
-        canvas,
-        fps_rect,
-        fps_idx,
-        0,
-        len(CAM_FPS_OPTIONS) - 1,
-        "CAM FPS",
-        str(CAMERA_FPS),
-    )
-    UI_HITBOXES.append({"type": "slider_steps", "id": "cam_fps", "rect": fps_rect, "steps": CAM_FPS_OPTIONS})
-    x += 200 + 40
-    _perf_wrap(220)
-
-    cam_res_val = 0 if CAMERA_MATCH_MAXH else CAMERA_REQ_HEIGHT
-    cam_res_idx = CAM_RES_OPTIONS.index(cam_res_val) if cam_res_val in CAM_RES_OPTIONS else 0
-    cam_res_text = "AUTO" if cam_res_val == 0 else str(cam_res_val)
-    res_rect = (x, perf_y + 20, x + 220, perf_y + 32)
-    _draw_slider(
-        canvas,
-        res_rect,
-        cam_res_idx,
-        0,
-        len(CAM_RES_OPTIONS) - 1,
-        "CAM RES",
-        cam_res_text,
-    )
-    UI_HITBOXES.append({"type": "slider_steps", "id": "cam_res", "rect": res_rect, "steps": CAM_RES_OPTIONS})
-    # Force FOURCC + thread toggles into the second line for spacing.
-    perf_y = row0b_y
-    x = UI_MARGIN_LEFT
-
-    fourcc_btn = (x, perf_y + 16, x + 120, perf_y + 40)
-    _draw_button(canvas, fourcc_btn, f"FOURCC {CAMERA_FOURCC}", False, True)
-    UI_HITBOXES.append({"type": "button", "id": "cam_fourcc", "rect": fourcc_btn, "enabled": True})
-    x += 120 + 12
-
-    cam_thr_btn = (x, perf_y + 16, x + 90, perf_y + 40)
-    _draw_button(canvas, cam_thr_btn, "CAM THR", USE_CAMERA_THREAD, True)
-    UI_HITBOXES.append({"type": "toggle", "id": "cam_thread", "rect": cam_thr_btn, "enabled": True})
-    x += 90 + 8
-
-    rtsp_thr_btn = (x, perf_y + 16, x + 100, perf_y + 40)
-    _draw_button(canvas, rtsp_thr_btn, "RTSP THR", USE_RTSP_THREAD, True)
-    UI_HITBOXES.append({"type": "toggle", "id": "rtsp_thread", "rect": rtsp_thr_btn, "enabled": True})
-
-    # RES buttons
-    x = UI_MARGIN_LEFT
-    _draw_label(canvas, "RES (1-5)", x, row1_y - 6)
-    for idx, res in enumerate(RES_OPTIONS):
-        rect = (x, row1_y, x + 52, row1_y + btn_h)
-        _draw_button(canvas, rect, f"{idx+1}:{res}", current_res == res, True)
-        UI_HITBOXES.append({"type": "button", "id": "res", "rect": rect, "value": idx, "enabled": True})
-        x += 52 + gap
-    x += 12
-
-    # MODEL buttons
-    _wrap_if_needed(230)
-    _draw_label(canvas, "MODEL (a/s/d)", x, row1_y - 6)
-    model_items = [(ord("a"), "a:n"), (ord("s"), "s:s"), (ord("d"), "d:m")]
-    for key, label in model_items:
-        rect = (x, row1_y, x + 56, row1_y + btn_h)
-        _draw_button(canvas, rect, label, CURRENT_MODEL_KEY == key, True)
-        UI_HITBOXES.append({"type": "button", "id": "model", "rect": rect, "value": key, "enabled": True})
-        x += 56 + gap
-    x += 12
-
-    # SOURCE buttons
-    _wrap_if_needed(220)
-    _draw_label(canvas, "SRC (c/v/n)", x, row1_y - 6)
-    source_items = [
-        ("camera", "c:cam", True),
-        ("video", "v:vid", bool(VIDEO_FILES)),
-        ("ndi", "n:ndi", bool(ENABLE_NDI and ENABLE_NDI_INPUT)),
-        ("rtsp", "r:rtsp", bool(ENABLE_RTSP_INPUT and RTSP_URL)),
-    ]
-    for src, label, enabled in source_items:
-        rect = (x, row1_y, x + 60, row1_y + btn_h)
-        _draw_button(canvas, rect, label, CURRENT_SOURCE == src, enabled)
-        UI_HITBOXES.append({"type": "button", "id": "source", "rect": rect, "value": src, "enabled": enabled})
-        x += 60 + gap
-
-    # Toggle buttons row (use remaining width)
-    x = UI_MARGIN_LEFT
-    toggle_y = row1_y + btn_h + 40
-    blur_rect = (x, toggle_y, x + 72, toggle_y + btn_h)
-    _draw_button(canvas, blur_rect, "b:blur", BLUR_ENABLED, True)
-    UI_HITBOXES.append({"type": "toggle", "id": "blur_enabled", "rect": blur_rect, "enabled": True})
-    x += 72 + gap + 8
-
-    hi_rect = (x, toggle_y, x + 90, toggle_y + btn_h)
-    _draw_button(canvas, hi_rect, "h:hi", HIGH_PRECISION_MODE, True)
-    UI_HITBOXES.append({"type": "toggle", "id": "high_prec", "rect": hi_rect, "enabled": True})
-    x += 90 + gap + 12
-
-    _draw_label(canvas, "MASK (m)", x, toggle_y - 6)
-    soft_rect = (x, toggle_y, x + 70, toggle_y + btn_h)
-    _draw_button(canvas, soft_rect, "soft", not SHOW_DETAIL, True)
-    UI_HITBOXES.append({"type": "button", "id": "mask_view", "rect": soft_rect, "value": "soft", "enabled": True})
-    x += 70 + gap
-    detail_rect = (x, toggle_y, x + 70, toggle_y + btn_h)
-    _draw_button(canvas, detail_rect, "detail", SHOW_DETAIL, True)
-    UI_HITBOXES.append({"type": "button", "id": "mask_view", "rect": detail_rect, "value": "detail", "enabled": True})
-    x += 70 + gap + 12
-
-    flip_rect = (x, toggle_y, x + 90, toggle_y + btn_h)
-    _draw_button(canvas, flip_rect, "f:flip", FLIP_INPUT, True)
-    UI_HITBOXES.append({"type": "toggle", "id": "flip", "rect": flip_rect, "enabled": True})
-    x += 90 + gap + 12
-
-
-    # NDI toggles moved to per-view bottom-left corners.
-
-    # Row 2: PEOPLE slider + BLUR kernel
-    x = UI_MARGIN_LEFT
-    people_rect = (x, row2_y + 20, x + 260, row2_y + 32)
-    _draw_slider(
-        canvas,
-        people_rect,
-        CURRENT_PEOPLE_LIMIT,
-        PEOPLE_LIMIT_OPTIONS[0],
-        PEOPLE_LIMIT_OPTIONS[-1],
-        "PEOPLE (+/-)",
-        str(CURRENT_PEOPLE_LIMIT),
-    )
-    UI_HITBOXES.append({"type": "slider", "id": "people", "rect": people_rect})
-    x += 260 + 60
-
-    kernel_rect = (x, row2_y + 20, x + 220, row2_y + 32)
-    _draw_slider(
-        canvas,
-        kernel_rect,
-        BLUR_KERNEL_IDX,
-        0,
-        len(BLUR_KERNEL_OPTIONS) - 1,
-        "KERN (o/p)",
-        str(BLUR_KERNEL_OPTIONS[BLUR_KERNEL_IDX]),
-    )
-    UI_HITBOXES.append({"type": "slider_steps", "id": "blur_kernel", "rect": kernel_rect, "steps": BLUR_KERNEL_OPTIONS})
-
-    # Row 3: THRESH + IMG SIZE
-    x = UI_MARGIN_LEFT
-    thresh_rect = (x, row3_y + 20, x + 340, row3_y + 32)
-    _draw_slider(canvas, thresh_rect, MASK_THRESH, 0, 255, "THRESH (j/k)", str(MASK_THRESH))
-    UI_HITBOXES.append({"type": "slider", "id": "mask_thresh", "rect": thresh_rect})
-    x += 340 + 60
-
-    imgsz_rect = (x, row3_y + 20, x + 220, row3_y + 32)
-    _draw_slider(
-        canvas,
-        imgsz_rect,
-        IMG_SIZE_IDX,
-        0,
-        len(IMG_SIZE_OPTIONS) - 1,
-        "IMG (,/.)",
-        str(IMG_SIZE_OPTIONS[IMG_SIZE_IDX]),
-    )
-    UI_HITBOXES.append({"type": "slider_steps", "id": "img_size", "rect": imgsz_rect, "steps": IMG_SIZE_OPTIONS})
-
-    # Row 4: persistence sliders
-    x = UI_MARGIN_LEFT
-    hold_rect = (x, row4_y + 20, x + 260, row4_y + 32)
-    _draw_slider(
-        canvas,
-        hold_rect,
-        PERSIST_HOLD_SEC,
-        0.1,
-        1.0,
-        "PERSIST HOLD",
-        f"{PERSIST_HOLD_SEC:.2f}s",
-    )
-    UI_HITBOXES.append({"type": "slider", "id": "persist_hold", "rect": hold_rect})
-    x += 260 + 60
-
-    rise_rect = (x, row4_y + 20, x + 220, row4_y + 32)
-    _draw_slider(
-        canvas,
-        rise_rect,
-        PERSIST_RISE_TAU,
-        0.05,
-        0.5,
-        "PERSIST RISE",
-        f"{PERSIST_RISE_TAU:.2f}s",
-    )
-    UI_HITBOXES.append({"type": "slider", "id": "persist_rise", "rect": rise_rect})
-    x += 220 + 60
-
-    fall_rect = (x, row4_y + 20, x + 220, row4_y + 32)
-    _draw_slider(
-        canvas,
-        fall_rect,
-        PERSIST_FALL_TAU,
-        0.1,
-        0.8,
-        "PERSIST FALL",
-        f"{PERSIST_FALL_TAU:.2f}s",
-    )
-    UI_HITBOXES.append({"type": "slider", "id": "persist_fall", "rect": fall_rect})
-
-    # Bottom row for right panel moved to main canvas.
-
-    # Row 5: OSC target
-    x = UI_MARGIN_LEFT
-    osc_ip_text = UI_TEXT_BUFFER if UI_ACTIVE_TEXT == "osc_ip" else OSC_IP
-    osc_port_text = UI_TEXT_BUFFER if UI_ACTIVE_TEXT == "osc_port" else str(OSC_PORT)
-    ip_rect = (x, row5_y + 20, x + 260, row5_y + 44)
-    _draw_text_input(ip_rect, "OSC IP", osc_ip_text, UI_ACTIVE_TEXT == "osc_ip")
-    UI_HITBOXES.append({"type": "text", "id": "osc_ip", "rect": ip_rect, "enabled": True})
-    x += 260 + 20
-
-    port_rect = (x, row5_y + 20, x + 120, row5_y + 44)
-    _draw_text_input(port_rect, "OSC PORT", osc_port_text, UI_ACTIVE_TEXT == "osc_port")
-    UI_HITBOXES.append({"type": "text", "id": "osc_port", "rect": port_rect, "enabled": True})
-    x += 120 + 10
-
-    osc_btn = (x, row5_y + 20, x + 70, row5_y + 44)
-    _draw_button(canvas, osc_btn, "OSC", OSC_ENABLED, True)
-    UI_HITBOXES.append({"type": "toggle", "id": "osc_enabled", "rect": osc_btn, "enabled": True})
-    x += 70 + 8
-
-    chk_rect = (x, row5_y + 26, x + 12, row5_y + 38)
-    chk_color = (80, 180, 80) if OSC_ENABLED else (60, 60, 60)
-    cv2.rectangle(canvas, (chk_rect[0], chk_rect[1]), (chk_rect[2], chk_rect[3]), chk_color, -1)
-    cv2.rectangle(canvas, (chk_rect[0], chk_rect[1]), (chk_rect[2], chk_rect[3]), (90, 90, 90), 1)
-
-
-def _point_in_rect(x: int, y: int, rect: Tuple[int, int, int, int]) -> bool:
-    x1, y1, x2, y2 = rect
-    return x1 <= x <= x2 and y1 <= y <= y2
-
-
-def _apply_button_action(item: dict) -> None:
-    global UI_PENDING_MODEL_KEY, UI_PENDING_SOURCE, SHOW_DETAIL, FLIP_INPUT, HIGH_PRECISION_MODE
-    global BLUR_ENABLED, ROI_LIST, ROI_STATE, ROI_DIRTY
-    global MASK_ROI_LIST, MASK_ROI_DIRTY
-    global ENABLE_NDI_INPUT, ENABLE_NDI_OUTPUT, ENABLE_NDI_TRANSLATIONS_OUTPUT, CURRENT_SOURCE
-    global ENABLE_RTSP_INPUT, RTSP_URL
-    global OSC_ENABLED
-    global CAMERA_INDEX, CAMERA_INDEX_CHANGED
-    global CAMERA_FOURCC, USE_CAMERA_THREAD, USE_RTSP_THREAD
-    item_id = item["id"]
-    if item_id == "res":
-        set_resolution_by_index(int(item["value"]))
-        save_settings()
-        return
-    if item_id == "model":
-        UI_PENDING_MODEL_KEY = item["value"]
-        return
-    if item_id == "source":
-        if item["value"] == "camera" and CURRENT_SOURCE == "camera":
-            next_idx = None
-            for step in range(1, CAMERA_MAX_INDEX + 2):
-                cand = (CAMERA_INDEX + step) % (CAMERA_MAX_INDEX + 1)
-                if _probe_camera_index(cand):
-                    next_idx = cand
-                    break
-            if next_idx is not None:
-                globals()["CAMERA_INDEX"] = next_idx
-                globals()["CAMERA_INDEX_CHANGED"] = True
-                save_settings()
-                UI_PENDING_SOURCE = "camera"
-            return
-        UI_PENDING_SOURCE = item["value"]
-        return
-    if item_id == "mask_view":
-        SHOW_DETAIL = item["value"] == "detail"
-        save_settings()
-        return
-    if item_id == "flip":
-        FLIP_INPUT = not FLIP_INPUT
-        save_settings()
-        return
-    if item_id == "high_prec":
-        HIGH_PRECISION_MODE = not HIGH_PRECISION_MODE
-        save_settings()
-        return
-    if item_id == "blur_enabled":
-        BLUR_ENABLED = not BLUR_ENABLED
-        save_settings()
-        return
-    if item_id == "roi_add":
-        add_roi()
-        return
-    if item_id == "roi_remove":
-        if ROI_LIST:
-            ROI_LIST.pop()
-            ROI_STATE = ROI_STATE[: len(ROI_LIST)]
-            ROI_DIRTY = True
-        return
-    if item_id == "roi_reset":
-        ROI_LIST.clear()
-        ROI_STATE.clear()
-        ROI_DIRTY = True
-        return
-    if item_id == "mask_roi_add":
-        add_mask_roi()
-        return
-    if item_id == "mask_roi_remove":
-        if MASK_ROI_LIST:
-            MASK_ROI_LIST.pop()
-            MASK_ROI_DIRTY = True
-        return
-    if item_id == "mask_roi_reset":
-        MASK_ROI_LIST.clear()
-        MASK_ROI_DIRTY = True
-        return
-    if item_id == "ndi_input":
-        ENABLE_NDI_INPUT = not ENABLE_NDI_INPUT
-        if not ENABLE_NDI_INPUT and CURRENT_SOURCE == "ndi":
-            UI_PENDING_SOURCE = "camera"
-        save_settings()
-        return
-    if item_id == "ndi_output":
-        ENABLE_NDI_OUTPUT = not ENABLE_NDI_OUTPUT
-        save_settings()
-        return
-    if item_id == "ndi_trans_output":
-        ENABLE_NDI_TRANSLATIONS_OUTPUT = not ENABLE_NDI_TRANSLATIONS_OUTPUT
-        save_settings()
-        return
-    if item_id == "rtsp_input":
-        ENABLE_RTSP_INPUT = not ENABLE_RTSP_INPUT
-        if not ENABLE_RTSP_INPUT and CURRENT_SOURCE == "rtsp":
-            UI_PENDING_SOURCE = "camera"
-        save_settings()
-        return
-    if item_id == "rtsp_cfg":
-        load_rtsp_url_from_settings()
-        save_settings()
-        UI_PENDING_SOURCE = "rtsp"
-        return
-    if item_id == "cam_fourcc":
-        if CAMERA_FOURCC in CAM_FOURCC_OPTIONS:
-            idx = CAM_FOURCC_OPTIONS.index(CAMERA_FOURCC)
-            CAMERA_FOURCC = CAM_FOURCC_OPTIONS[(idx + 1) % len(CAM_FOURCC_OPTIONS)]
+WINDOW_NAME = "NEXT2"
+CANVAS_WIDTH = max(320, int(os.environ.get("NEXT_CANVAS_W", "1536")))
+CANVAS_HEIGHT = max(240, int(os.environ.get("NEXT_CANVAS_H", "864")))
+CAM_MAX_INDEX = max(0, int(os.environ.get("NEXT_CAM_MAX", "4")))
+CAM_WIDTH = max(0, int(os.environ.get("NEXT_CAM_WIDTH", "1280")))
+CAM_HEIGHT = max(0, int(os.environ.get("NEXT_CAM_HEIGHT", "720")))
+YOLO_MODEL_PATH = os.environ.get("NEXT_YOLO_MODEL", "yolov8n-seg.pt")
+YOLO_CONF = float(os.environ.get("NEXT_YOLO_CONF", "0.25"))
+YOLO_IMGSZ = int(os.environ.get("NEXT_YOLO_IMGSZ", "320"))
+YOLO_DEVICE = os.environ.get("NEXT_YOLO_DEVICE", "").strip()
+YOLO_SKIP_FRAMES = max(0, int(os.environ.get("NEXT_YOLO_SKIP", "0")))
+MAX_SKIP_FRAMES = max(0, int(os.environ.get("NEXT_YOLO_SKIP_MAX", "5")))
+MAX_PERSON_LIMIT = int(os.environ.get("NEXT_PERSON_LIMIT_MAX", "30"))
+MASK_BLUR = max(0, int(os.environ.get("NEXT_MASK_BLUR", "5")))
+MAX_MASK_BLUR = max(1, int(os.environ.get("NEXT_MASK_BLUR_MAX", "15")))
+CONF_MIN = float(os.environ.get("NEXT_CONF_MIN", "0.1"))
+CONF_MAX = float(os.environ.get("NEXT_CONF_MAX", "0.6"))
+IMG_SIZES = [256, 320, 384, 448, 512, 640]
+MAX_MORPH = max(0, int(os.environ.get("NEXT_MASK_MORPH_MAX", "5")))
+DEFAULT_SETTINGS_PATH = str(Path(__file__).resolve().parent / "settings.json")
+SETTINGS_PATH = os.environ.get("NEXT_SETTINGS_PATH", DEFAULT_SETTINGS_PATH)
+SETTINGS_SAVE_INTERVAL = float(os.environ.get("NEXT_SETTINGS_SAVE_SEC", "0.75"))
+
+RES_OPTIONS = [
+    ("320x180", 320, 180),
+    ("480x270", 480, 270),
+    ("640x360", 640, 360),
+]
+MODEL_OPTIONS = [
+    ("FAST", "yolov8n-seg.pt"),
+    ("MED", "yolov8s-seg.pt"),
+    ("HEAVY", "yolov8m-seg.pt"),
+]
+
+UI_FONT = cv2.FONT_HERSHEY_SIMPLEX
+UI_FONT_SCALE = 0.5
+UI_TEXT_THICKNESS = 1
+UI_BTN_W = 120
+UI_BTN_H = 26
+UI_BTN_GAP = 10
+UI_SECTION_GAP = 22
+UI_LEFT_MARGIN = 20
+UI_TOP_MARGIN = 20
+
+
+def _open_camera(idx: int) -> Optional[cv2.VideoCapture]:
+    try:
+        if sys.platform == "darwin":
+            cap = cv2.VideoCapture(idx, cv2.CAP_AVFOUNDATION)
         else:
-            CAMERA_FOURCC = CAM_FOURCC_OPTIONS[0]
-        save_settings()
-        if CURRENT_SOURCE == "camera":
-            CAMERA_INDEX_CHANGED = True
-            UI_PENDING_SOURCE = "camera"
-        return
-    if item_id == "cam_thread":
-        USE_CAMERA_THREAD = not USE_CAMERA_THREAD
-        save_settings()
-        if CURRENT_SOURCE == "camera":
-            CAMERA_INDEX_CHANGED = True
-            UI_PENDING_SOURCE = "camera"
-        return
-    if item_id == "rtsp_thread":
-        USE_RTSP_THREAD = not USE_RTSP_THREAD
-        save_settings()
-        if CURRENT_SOURCE == "rtsp":
-            UI_PENDING_SOURCE = "rtsp"
-        return
-    if item_id == "osc_enabled":
-        OSC_ENABLED = not OSC_ENABLED
-        save_settings()
-        return
-
-
-def _handle_text_input(key: int) -> bool:
-    global UI_ACTIVE_TEXT, UI_TEXT_BUFFER, OSC_IP, OSC_PORT
-    if UI_ACTIVE_TEXT is None:
-        return False
-    if key in (13, 10):  # Enter
-        if UI_ACTIVE_TEXT == "osc_ip":
-            val = UI_TEXT_BUFFER.strip()
-            if val:
-                OSC_IP = val
-        elif UI_ACTIVE_TEXT == "osc_port":
-            try:
-                val = int(UI_TEXT_BUFFER)
-                if 1 <= val <= 65535:
-                    OSC_PORT = val
-            except Exception:
-                pass
-        UI_ACTIVE_TEXT = None
-        UI_TEXT_BUFFER = ""
-        save_settings()
-        return True
-    if key == 27:  # Esc
-        UI_ACTIVE_TEXT = None
-        UI_TEXT_BUFFER = ""
-        return True
-    if key in (8, 127):  # Backspace
-        UI_TEXT_BUFFER = UI_TEXT_BUFFER[:-1]
-        return True
-    if 32 <= key <= 126:
-        ch = chr(key)
-        if UI_ACTIVE_TEXT == "osc_ip":
-            if ch.isalnum() or ch in ".-":
-                UI_TEXT_BUFFER = (UI_TEXT_BUFFER + ch)[:32]
-        else:
-            if ch.isdigit():
-                UI_TEXT_BUFFER = (UI_TEXT_BUFFER + ch)[:5]
-        return True
-    return True
-
-
-def _apply_slider_action(item: dict, x: int) -> None:
-    global CURRENT_PEOPLE_LIMIT, BLUR_KERNEL_IDX, MASK_THRESH, IMG_SIZE_IDX
-    global PROCESS_EVERY_N, CAMERA_FPS, CAMERA_REQ_HEIGHT, CAMERA_REQ_WIDTH, CAMERA_MATCH_MAXH
-    global CAMERA_INDEX_CHANGED
-    x1, _, x2, _ = item["rect"]
-    if x2 <= x1:
-        return
-    ratio = (x - x1) / float(x2 - x1)
-    ratio = max(0.0, min(1.0, ratio))
-    item_id = item["id"]
-
-    if item["type"] == "slider_steps":
-        steps = item["steps"]
-        idx = int(round(ratio * (len(steps) - 1))) if steps else 0
-        idx = max(0, min(idx, len(steps) - 1))
-        if item_id == "process_every":
-            val = steps[idx]
-            if val != PROCESS_EVERY_N:
-                PROCESS_EVERY_N = val
-                save_settings()
-        elif item_id == "cam_fps":
-            val = steps[idx]
-            if val != CAMERA_FPS:
-                CAMERA_FPS = val
-                save_settings()
-                if CURRENT_SOURCE == "camera":
-                    CAMERA_INDEX_CHANGED = True
-                    globals()["UI_PENDING_SOURCE"] = "camera"
-        elif item_id == "cam_res":
-            val = steps[idx]
-            if val == 0:
-                CAMERA_MATCH_MAXH = True
-                CAMERA_REQ_HEIGHT = 0
-                CAMERA_REQ_WIDTH = 0
-            else:
-                CAMERA_MATCH_MAXH = False
-                CAMERA_REQ_HEIGHT = val
-                CAMERA_REQ_WIDTH = int(val * 16 / 9)
-            save_settings()
-            if CURRENT_SOURCE == "camera":
-                CAMERA_INDEX_CHANGED = True
-                globals()["UI_PENDING_SOURCE"] = "camera"
-        elif item_id == "blur_kernel" and idx != BLUR_KERNEL_IDX:
-            BLUR_KERNEL_IDX = idx
-            save_settings()
-        elif item_id == "img_size" and idx != IMG_SIZE_IDX:
-            IMG_SIZE_IDX = idx
-            save_settings()
-        return
-
-    if item_id == "people":
-        min_val, max_val = PEOPLE_LIMIT_OPTIONS[0], PEOPLE_LIMIT_OPTIONS[-1]
-        val = int(round(min_val + ratio * (max_val - min_val)))
-        val = max(min_val, min(max_val, val))
-        if val != CURRENT_PEOPLE_LIMIT:
-            CURRENT_PEOPLE_LIMIT = val
-            save_settings()
-        return
-    if item_id == "mask_thresh":
-        val = int(round(ratio * 255))
-        val = max(0, min(255, val))
-        if val != MASK_THRESH:
-            MASK_THRESH = val
-            save_settings()
-        return
-    if item_id == "persist_hold":
-        min_val, max_val = 0.1, 1.0
-        val = min_val + ratio * (max_val - min_val)
-        if abs(val - PERSIST_HOLD_SEC) > 1e-3:
-            globals()["PERSIST_HOLD_SEC"] = val
-        return
-    if item_id == "persist_rise":
-        min_val, max_val = 0.05, 0.5
-        val = min_val + ratio * (max_val - min_val)
-        if abs(val - PERSIST_RISE_TAU) > 1e-3:
-            globals()["PERSIST_RISE_TAU"] = val
-        return
-    if item_id == "persist_fall":
-        min_val, max_val = 0.1, 0.8
-        val = min_val + ratio * (max_val - min_val)
-        if abs(val - PERSIST_FALL_TAU) > 1e-3:
-            globals()["PERSIST_FALL_TAU"] = val
-        return
-
-
-def on_mouse(event: int, x: int, y: int, flags: int, param: Any) -> None:
-    global UI_ACTIVE_SLIDER, ROI_ACTIVE_IDX, ROI_DRAG_OFFSET, ROI_DIRTY
-    global MASK_ROI_ACTIVE_IDX, MASK_ROI_DRAG_OFFSET, MASK_ROI_DIRTY
-    global UI_ACTIVE_TEXT, UI_TEXT_BUFFER
-
-    if event == cv2.EVENT_LBUTTONDOWN:
-        if ROI_PANEL_BOUNDS_ABS is not None:
-            bx, by, bw, bh = ROI_PANEL_BOUNDS_ABS
-            if bx <= x <= bx + bw and by <= y <= by + bh:
-                local_x = x - bx
-                local_y = y - by
-                for idx, roi in enumerate(reversed(ROI_LIST)):
-                    real_idx = len(ROI_LIST) - 1 - idx
-                    rx1, ry1, rx2, ry2 = _roi_rect(roi)
-                    if rx1 <= local_x <= rx2 and ry1 <= local_y <= ry2:
-                        ROI_ACTIVE_IDX = real_idx
-                        ROI_DRAG_OFFSET = (roi["cx"] - local_x, roi["cy"] - local_y)
-                        return
-        if MASK_ROI_PANEL_BOUNDS_ABS is not None:
-            bx, by, bw, bh = MASK_ROI_PANEL_BOUNDS_ABS
-            if bx <= x <= bx + bw and by <= y <= by + bh:
-                local_x = x - bx
-                local_y = y - by
-                for idx, roi in enumerate(reversed(MASK_ROI_LIST)):
-                    real_idx = len(MASK_ROI_LIST) - 1 - idx
-                    rx1, ry1, rx2, ry2 = _roi_rect(roi)
-                    if rx1 <= local_x <= rx2 and ry1 <= local_y <= ry2:
-                        MASK_ROI_ACTIVE_IDX = real_idx
-                        MASK_ROI_DRAG_OFFSET = (roi["cx"] - local_x, roi["cy"] - local_y)
-                        return
-
-        clicked_text = False
-        for item in VIEW_HITBOXES + UI_HITBOXES:
-            if not item.get("enabled", True):
-                continue
-            if _point_in_rect(x, y, item["rect"]):
-                if item.get("type") == "view_tab":
-                    globals()["ACTIVE_VIEW_TAB"] = item["value"]
-                    UI_ACTIVE_TEXT = None
-                    return
-                if item["type"] in {"slider", "slider_steps"}:
-                    UI_ACTIVE_SLIDER = item
-                    UI_ACTIVE_TEXT = None
-                    _apply_slider_action(item, x)
-                else:
-                    if item.get("type") == "text":
-                        UI_ACTIVE_TEXT = item["id"]
-                        UI_TEXT_BUFFER = OSC_IP if UI_ACTIVE_TEXT == "osc_ip" else str(OSC_PORT)
-                        clicked_text = True
-                    else:
-                        UI_ACTIVE_TEXT = None
-                        _apply_button_action(item)
-                return
-        if not clicked_text:
-            UI_ACTIVE_TEXT = None
-
-    if event == cv2.EVENT_MOUSEMOVE:
-        if ROI_ACTIVE_IDX is not None and ROI_PANEL_BOUNDS_ABS is not None and flags & cv2.EVENT_FLAG_LBUTTON:
-            bx, by, bw, bh = ROI_PANEL_BOUNDS_ABS
-            local_x = x - bx
-            local_y = y - by
-            dx, dy = ROI_DRAG_OFFSET
-            roi = ROI_LIST[ROI_ACTIVE_IDX]
-            roi["cx"] = int(local_x + dx)
-            roi["cy"] = int(local_y + dy)
-            _clamp_roi(roi, bw, bh)
-            ROI_DIRTY = True
-            return
-        if (
-            MASK_ROI_ACTIVE_IDX is not None
-            and MASK_ROI_PANEL_BOUNDS_ABS is not None
-            and flags & cv2.EVENT_FLAG_LBUTTON
-        ):
-            bx, by, bw, bh = MASK_ROI_PANEL_BOUNDS_ABS
-            local_x = x - bx
-            local_y = y - by
-            dx, dy = MASK_ROI_DRAG_OFFSET
-            roi = MASK_ROI_LIST[MASK_ROI_ACTIVE_IDX]
-            roi["cx"] = int(local_x + dx)
-            roi["cy"] = int(local_y + dy)
-            _clamp_roi(roi, bw, bh)
-            MASK_ROI_DIRTY = True
-            return
-        if UI_ACTIVE_SLIDER is not None and flags & cv2.EVENT_FLAG_LBUTTON:
-            _apply_slider_action(UI_ACTIVE_SLIDER, x)
-            return
-
-    if event == cv2.EVENT_MOUSEWHEEL:
-        if not (flags & cv2.EVENT_FLAG_SHIFTKEY):
-            return
-        if ROI_PANEL_BOUNDS_ABS is None:
-            bx = by = bw = bh = None
-        else:
-            bx, by, bw, bh = ROI_PANEL_BOUNDS_ABS
-        delta = (flags >> 16) & 0xFFFF
-        if delta & 0x8000:
-            delta = delta - 0x10000
-        if delta == 0:
-            return
-        handled = False
-        if ROI_PANEL_BOUNDS_ABS is not None and bx <= x <= bx + bw and by <= y <= by + bh:
-            local_x = x - bx
-            local_y = y - by
-            target_idx = None
-            for idx in range(len(ROI_LIST) - 1, -1, -1):
-                rx1, ry1, rx2, ry2 = _roi_rect(ROI_LIST[idx])
-                if rx1 <= local_x <= rx2 and ry1 <= local_y <= ry2:
-                    target_idx = idx
-                    break
-            if target_idx is not None:
-                roi = ROI_LIST[target_idx]
-                step = 6 if delta > 0 else -6
-                roi["half"] = int(roi["half"]) + step
-                _clamp_roi(roi, bw, bh)
-                ROI_DIRTY = True
-                handled = True
-        if (
-            not handled
-            and MASK_ROI_PANEL_BOUNDS_ABS is not None
-        ):
-            bx, by, bw, bh = MASK_ROI_PANEL_BOUNDS_ABS
-            if bx <= x <= bx + bw and by <= y <= by + bh:
-                local_x = x - bx
-                local_y = y - by
-                target_idx = None
-                for idx in range(len(MASK_ROI_LIST) - 1, -1, -1):
-                    rx1, ry1, rx2, ry2 = _roi_rect(MASK_ROI_LIST[idx])
-                    if rx1 <= local_x <= rx2 and ry1 <= local_y <= ry2:
-                        target_idx = idx
-                        break
-                if target_idx is not None:
-                    roi = MASK_ROI_LIST[target_idx]
-                    step = 6 if delta > 0 else -6
-                    roi["half"] = int(roi["half"]) + step
-                    _clamp_roi(roi, bw, bh)
-                    MASK_ROI_DIRTY = True
-        return
-
-    if event == cv2.EVENT_LBUTTONUP:
-        UI_ACTIVE_SLIDER = None
-        ROI_ACTIVE_IDX = None
-        MASK_ROI_ACTIVE_IDX = None
-
-
-def set_resolution_by_index(idx: int):
-    """Set CURRENT_MAX_HEIGHT by index."""
-    global CURRENT_MAX_HEIGHT
-    idx = max(0, min(idx, len(RES_OPTIONS) - 1))
-    CURRENT_MAX_HEIGHT = RES_OPTIONS[idx]
-    try:
-        RES_SAVE_FILE.write_text(str(CURRENT_MAX_HEIGHT), encoding="utf-8")
-    except OSError:
-        pass
-
-
-def load_saved_resolution():
-    """Load saved resolution if present and valid."""
-    global CURRENT_MAX_HEIGHT
-    try:
-        val = int(RES_SAVE_FILE.read_text(encoding="utf-8").strip())
-        if val in RES_OPTIONS:
-            CURRENT_MAX_HEIGHT = val
-    except (OSError, ValueError):
-        pass
-
-
-def load_saved_model():
-    """Load saved model path if present and valid, updating current key/path."""
-    global CURRENT_MODEL_KEY, CURRENT_MODEL_PATH
-    try:
-        val = MODEL_SAVE_FILE.read_text(encoding="utf-8").strip()
-        for k, (path, _) in MODEL_OPTIONS.items():
-            if path == val:
-                CURRENT_MODEL_KEY = k
-                CURRENT_MODEL_PATH = path
-                return
-    except OSError:
-        pass
-
-
-def save_current_model():
-    """Persist current model path."""
-    try:
-        MODEL_SAVE_FILE.write_text(CURRENT_MODEL_PATH, encoding="utf-8")
-    except OSError:
-        pass
-
-
-def load_model(path: str):
-    """Load YOLO model on the configured device."""
-    mdl = YOLO(path)
-    mdl.to(DEVICE)
-    return mdl
-
-
-def load_rtsp_url_from_settings() -> None:
-    """Reload RTSP_URL from settings.json if present."""
-    global RTSP_URL
-    try:
-        import json
-
-        data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-        url = str(data.get("rtsp_url", RTSP_URL)).strip()
-        if url:
-            RTSP_URL = url
+            cap = cv2.VideoCapture(idx)
     except Exception:
-        pass
-
-
-def open_capture(source: str):
-    """Open capture for camera, video file, or NDI."""
-    global CURRENT_VIDEO_INDEX
-    if source == "camera":
-        global CAMERA_INDEX
-        picked = _pick_camera_index(CAMERA_INDEX)
-        if picked is None:
-            print("[CAM] No hay cámaras disponibles.", file=sys.stderr)
-            return None
-        CAMERA_INDEX = picked
-        cap = _open_camera_cap(CAMERA_INDEX)
-        if cap.isOpened():
-            req_w, req_h = _camera_request_size()
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, req_w)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, req_h)
-            if CAMERA_FPS:
-                cap.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
-            try:
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            except Exception:
-                pass
-            if CAMERA_FOURCC:
-                try:
-                    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*CAMERA_FOURCC))
-                except Exception:
-                    pass
-        if USE_CAMERA_THREAD:
-            return LatestFrameCapture(cap, grab_skip=CAMERA_GRAB_SKIP)
-        return cap
-    if source == "ndi":
-        return NDIReceiver(source_name=NDI_PREFERRED_SOURCE)
-    if source == "rtsp":
-        if not RTSP_URL:
-            print("RTSP URL vacío.", file=sys.stderr)
-            return None
-        if "OPENCV_FFMPEG_CAPTURE_OPTIONS" not in os.environ:
-            transport = "tcp" if RTSP_TRANSPORT == "tcp" else "udp"
-            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
-                f"rtsp_transport;{transport}|fflags;nobuffer|flags;low_delay|framedrop;1|max_delay;0|reorder_queue_size;0"
-            )
-        cap = cv2.VideoCapture(RTSP_URL, cv2.CAP_FFMPEG)
-        try:
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 2000)
-            cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 2000)
-        except Exception:
-            pass
-        if USE_RTSP_THREAD:
-            return LatestFrameCapture(cap, grab_skip=RTSP_GRAB_SKIP)
-        return cap
-    if source == "video":
-        if not VIDEO_FILES:
-            print("No hay videos en DATA/", file=sys.stderr)
-            return None
-        CURRENT_VIDEO_INDEX %= len(VIDEO_FILES)
-        path = VIDEO_FILES[CURRENT_VIDEO_INDEX]
-        cap = cv2.VideoCapture(str(path))
-        return cap
-    return None
-
-
-def source_label():
-    if CURRENT_SOURCE == "camera":
-        return "Camera"
-    if CURRENT_SOURCE == "ndi":
-        return "NDI"
-    if CURRENT_SOURCE == "rtsp":
-        return "RTSP"
-    if CURRENT_SOURCE == "video" and VIDEO_FILES:
-        return f"Video: {VIDEO_FILES[CURRENT_VIDEO_INDEX].name}"
-    return CURRENT_SOURCE
-
-
-def capture_ready(cap):
-    if cap is None:
-        return False
-    if isinstance(cap, NDIReceiver):
-        return cap.ready
-    if hasattr(cap, "isOpened"):
-        try:
-            return cap.isOpened()
-        except Exception:
-            return False
-    return cap.isOpened()
-
-
-def release_capture(cap):
-    if cap is None:
-        return
-    if hasattr(cap, "release"):
+        return None
+    if not cap or not cap.isOpened():
         try:
             cap.release()
         except Exception:
             pass
+        return None
+    if CAM_WIDTH > 0 and CAM_HEIGHT > 0:
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
+    return cap
 
 
-def apply_model_change(model: YOLO, new_key: int, load: bool = True) -> YOLO:
-    """Swap YOLO model if key differs; keeps current on failure."""
-    global CURRENT_MODEL_KEY, CURRENT_MODEL_PATH
-    if new_key not in MODEL_OPTIONS or new_key == CURRENT_MODEL_KEY:
-        return model
-    CURRENT_MODEL_KEY = new_key
-    CURRENT_MODEL_PATH = MODEL_OPTIONS[new_key][0]
-    save_current_model()
-    save_settings()
-    if not load:
-        return model
+def _cycle_camera(start_idx: int) -> Tuple[Optional[cv2.VideoCapture], int]:
+    for step in range(CAM_MAX_INDEX + 1):
+        idx = (start_idx + step) % (CAM_MAX_INDEX + 1)
+        cap = _open_camera(idx)
+        if cap is not None:
+            return cap, idx
+    return None, start_idx
+
+
+def _placeholder(frame_size: Tuple[int, int]) -> np.ndarray:
+    w, h = frame_size
+    img = np.zeros((h, w, 3), dtype=np.uint8)
+    cv2.putText(
+        img,
+        "No camera",
+        (30, 60),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.0,
+        (0, 0, 255),
+        2,
+    )
+    return img
+
+
+def _fit_to_box(image: np.ndarray, box_w: int, box_h: int) -> np.ndarray:
+    h, w = image.shape[:2]
+    scale = min(box_w / float(w), box_h / float(h))
+    new_w = max(1, int(w * scale))
+    new_h = max(1, int(h * scale))
+    resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    canvas = np.zeros((box_h, box_w, 3), dtype=np.uint8)
+    x_off = 0
+    y_off = 0
+    canvas[y_off : y_off + new_h, x_off : x_off + new_w] = resized
+    return canvas
+
+
+def _fit_to_box_with_rect(
+    image: np.ndarray, box_w: int, box_h: int
+) -> Tuple[np.ndarray, Tuple[int, int, int, int]]:
+    h, w = image.shape[:2]
+    scale = min(box_w / float(w), box_h / float(h))
+    new_w = max(1, int(w * scale))
+    new_h = max(1, int(h * scale))
+    resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    canvas = np.zeros((box_h, box_w, 3), dtype=np.uint8)
+    x_off = 0
+    y_off = 0
+    canvas[y_off : y_off + new_h, x_off : x_off + new_w] = resized
+    return canvas, (x_off, y_off, x_off + new_w, y_off + new_h)
+
+
+def _fit_to_width(image: np.ndarray, target_w: int) -> np.ndarray:
+    h, w = image.shape[:2]
+    if w <= 0:
+        return image
+    scale = target_w / float(w)
+    new_h = max(1, int(h * scale))
+    return cv2.resize(image, (target_w, new_h), interpolation=cv2.INTER_AREA)
+
+def _mask_placeholder(frame_size: Tuple[int, int]) -> np.ndarray:
+    w, h = frame_size
+    img = np.zeros((h, w, 3), dtype=np.uint8)
+    cv2.putText(
+        img,
+        "No mask",
+        (30, 60),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (80, 80, 80),
+        2,
+    )
+    return img
+
+
+def _smooth_mask(mask: np.ndarray) -> np.ndarray:
+    if MASK_BLUR <= 1:
+        return mask
+    k = MASK_BLUR if MASK_BLUR % 2 == 1 else MASK_BLUR + 1
+    return cv2.GaussianBlur(mask, (k, k), 0)
+
+
+def _apply_morph(mask: np.ndarray, strength: int) -> np.ndarray:
+    if strength == 0:
+        return mask
+    k = abs(strength) * 2 + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    if strength > 0:
+        return cv2.dilate(mask, kernel, iterations=1)
+    return cv2.erode(mask, kernel, iterations=1)
+
+
+@dataclass
+class InferenceResult:
+    boxes: list[Tuple[int, int, int, int]] = field(default_factory=list)
+    combined_mask: Optional[np.ndarray] = None
+    persons: int = 0
+
+
+class YoloWorker:
+    def __init__(self, model: YOLO, device: str, conf: float, imgsz: int) -> None:
+        self.model = model
+        self.device = device
+        self.conf = conf
+        self.imgsz = imgsz
+        self._lock = threading.Lock()
+        self._cond = threading.Condition(self._lock)
+        self._pending_frame: Optional[np.ndarray] = None
+        self._stop = False
+        self._result = InferenceResult()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        with self._lock:
+            self._stop = True
+            self._cond.notify_all()
+        self._thread.join(timeout=1.0)
+
+    def submit(self, frame: np.ndarray) -> None:
+        with self._lock:
+            self._pending_frame = frame
+            self._cond.notify()
+
+    def get_latest(self) -> InferenceResult:
+        with self._lock:
+            return self._result
+
+    def update_params(self, conf: float, imgsz: int) -> None:
+        with self._lock:
+            self.conf = conf
+            self.imgsz = imgsz
+
+    def _loop(self) -> None:
+        while True:
+            with self._lock:
+                while self._pending_frame is None and not self._stop:
+                    self._cond.wait()
+                if self._stop:
+                    return
+                frame = self._pending_frame
+                self._pending_frame = None
+            try:
+                result = self.model.predict(
+                    source=frame,
+                    conf=self.conf,
+                    imgsz=self.imgsz,
+                    device=self.device,
+                    verbose=False,
+                )[0]
+                boxes_out: list[Tuple[int, int, int, int]] = []
+                persons = 0
+                combined_mask = None
+                mask_canvas = None
+                if result.boxes is not None:
+                    if result.masks is not None and result.masks.xy is not None:
+                        mask_canvas = np.zeros(frame.shape[:2], dtype=np.uint8)
+                        polygons = result.masks.xy
+                    else:
+                        polygons = None
+                    for idx, cls_id in enumerate(result.boxes.cls):
+                        if int(cls_id) != 0:
+                            continue
+                        persons += 1
+                        x1, y1, x2, y2 = result.boxes.xyxy[idx].int().tolist()
+                        boxes_out.append((x1, y1, x2, y2))
+                        if polygons is not None and idx < len(polygons):
+                            pts = polygons[idx].astype(np.int32)
+                            if pts.size > 0:
+                                cv2.fillPoly(mask_canvas, [pts], 255)
+                    if mask_canvas is not None:
+                        combined_mask = mask_canvas
+                with self._lock:
+                    self._result = InferenceResult(
+                        boxes=boxes_out,
+                        combined_mask=combined_mask,
+                        persons=persons,
+                    )
+            except Exception as exc:
+                print(f"[YOLO] Error de inferencia: {exc}", file=sys.stderr)
+                with self._lock:
+                    self._result = InferenceResult()
+
+
+@dataclass
+class UIState:
+    selected_res: int = 1
+    selected_model: int = 0
+    person_limit: int = 10
+    persons_detected: int = 0
+    slider_drag: bool = False
+    skip_drag: bool = False
+    skip_frames: int = YOLO_SKIP_FRAMES
+    conf_drag: bool = False
+    imgsz_drag: bool = False
+    blur_drag: bool = False
+    morph_drag: bool = False
+    conf: float = YOLO_CONF
+    imgsz_idx: int = 0
+    blur: int = MASK_BLUR
+    morph: int = 0
+    rects: Dict[str, Tuple[int, int, int, int]] = field(default_factory=dict)
+
+
+def _load_model(model_path: str) -> Optional[YOLO]:
+    if not Path(model_path).exists():
+        return None
     try:
-        return load_model(CURRENT_MODEL_PATH)
+        return YOLO(model_path)
     except Exception as exc:
-        print(f"No se pudo cargar el modelo {CURRENT_MODEL_PATH}: {exc}", file=sys.stderr)
-        return model
-
-
-def apply_source_change(new_source: str, cap):
-    """Swap capture source; keeps previous on failure."""
-    global CURRENT_SOURCE, CURRENT_VIDEO_INDEX, CAMERA_INDEX_CHANGED
-    if new_source == CURRENT_SOURCE and not (new_source == "camera" and CAMERA_INDEX_CHANGED):
-        return cap
-    if new_source == "video" and not VIDEO_FILES:
-        return cap
-    if new_source == "ndi" and (not ENABLE_NDI or not ENABLE_NDI_INPUT):
-        return cap
-    if new_source == "rtsp" and (not ENABLE_RTSP_INPUT or not RTSP_URL):
-        return cap
-
-    prev_cap, prev_src = cap, CURRENT_SOURCE
-    CURRENT_SOURCE = new_source
-    if new_source == "video":
-        CURRENT_VIDEO_INDEX = 0
-    new_cap = open_capture(CURRENT_SOURCE)
-    if not capture_ready(new_cap):
-        print(f"No se pudo abrir la fuente {new_source}, se mantiene la anterior.", file=sys.stderr)
-        release_capture(new_cap)
-        CURRENT_SOURCE = prev_src
-        return prev_cap
-    release_capture(prev_cap)
-    save_settings()
-    CAMERA_INDEX_CHANGED = False
-    return new_cap
-
-
-def _camera_request_size() -> Tuple[int, int]:
-    if CAMERA_REQ_WIDTH > 0 and CAMERA_REQ_HEIGHT > 0:
-        return CAMERA_REQ_WIDTH, CAMERA_REQ_HEIGHT
-    if CAMERA_MATCH_MAXH and CURRENT_MAX_HEIGHT > 0:
-        req_h = CURRENT_MAX_HEIGHT
-        req_w = int(req_h * 16 / 9)
-        return req_w, req_h
-    return CAP_WIDTH, CAP_HEIGHT
-
-
-def _open_camera_cap(idx: int) -> cv2.VideoCapture:
-    try:
-        if sys.platform == "darwin":
-            return cv2.VideoCapture(idx, cv2.CAP_AVFOUNDATION)
-    except Exception:
-        pass
-    return cv2.VideoCapture(idx)
-
-
-def _probe_camera_index(idx: int) -> bool:
-    cap = _open_camera_cap(idx)
-    ok = False
-    try:
-        if cap.isOpened():
-            req_w, req_h = _camera_request_size()
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, req_w)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, req_h)
-            if CAMERA_FPS:
-                cap.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
-            ok = True
-    except Exception:
-        ok = False
-    try:
-        cap.release()
-    except Exception:
-        pass
-    return ok
-
-
-def _pick_camera_index(start_idx: int) -> int | None:
-    if _probe_camera_index(start_idx):
-        return start_idx
-    for cand in range(CAMERA_MAX_INDEX + 1):
-        if cand == start_idx:
-            continue
-        if _probe_camera_index(cand):
-            return cand
-    return None
-
-
-# --------------- helpers NDI --------------------------------------
-def get_ndi_module():
-    """Intentar importar cyndilib (preferido). Evitamos NDIlib por segfaults reportados."""
-    try:
-        import importlib.resources as ir
-        # Aseguramos ruta de runtime NDI para cyndilib (incluye libndi.dylib empaquetado).
-        try:
-            bin_path = ir.files("cyndilib.wrapper").joinpath("bin")
-            bin_str = str(bin_path)
-            os.environ.setdefault("NDI_RUNTIME_DIR", bin_str)
-            os.environ["DYLD_LIBRARY_PATH"] = f"{bin_str}:{os.environ.get('DYLD_LIBRARY_PATH','')}"
-        except Exception:
-            pass
-        import cyndilib as ndi  # type: ignore
-
-        return ndi
-    except Exception:
+        print(f"[YOLO] No se pudo cargar modelo: {exc}", file=sys.stderr)
         return None
 
 
-# --------------- Probing seguro de NDI ----------------------------
-def _ndi_probe_worker(result_queue: mp.Queue):
-    """Intento seguro de cargar NDIlib en un proceso aislado."""
+def _load_settings(path: str) -> dict:
     try:
-        ndi = get_ndi_module()
-        if ndi is None:
-            result_queue.put(False)
-            return
-        # NDI salida no depende de fuentes detectadas; basta con cargar runtime.
-        result_queue.put(True)
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        if isinstance(data, dict):
+            return data
     except Exception:
-        result_queue.put(False)
+        return {}
+    return {}
 
 
-def probe_ndi_available(timeout: float = 3.0) -> bool:
-    """Carga NDIlib en un proceso aparte para evitar segfaults en el proceso principal."""
-    q: mp.Queue = mp.Queue()
-    p = mp.Process(target=_ndi_probe_worker, args=(q,), daemon=True)
-    p.start()
-    p.join(timeout)
-    ok = False
-    if p.exitcode is None:
-        p.terminate()
-    elif p.exitcode == 0 and not q.empty():
-        ok = bool(q.get())
-    return ok
-
-
-# --------------- persistencia de settings ---------------------------
-SETTINGS_FILE = Path(__file__).with_name("settings.json")
-
-
-def _clamp(val: int, low: int, high: int) -> int:
-    return max(low, min(high, val))
-
-
-def load_settings():
-    global CURRENT_PEOPLE_LIMIT, BLUR_KERNEL_IDX, BLUR_ENABLED, MASK_THRESH
-    global IMG_SIZE_IDX, HIGH_PRECISION_MODE, NDI_OUTPUT_MASK, CURRENT_SOURCE, SHOW_DETAIL, FLIP_INPUT
-    global ENABLE_NDI_INPUT, ENABLE_NDI_OUTPUT, ENABLE_NDI_TRANSLATIONS_OUTPUT, ENABLE_RTSP_INPUT, RTSP_URL
-    global OSC_IP, OSC_PORT, OSC_ENABLED
-    global PROCESS_EVERY_N, CAMERA_FPS, CAMERA_FOURCC, CAMERA_REQ_WIDTH, CAMERA_REQ_HEIGHT, CAMERA_MATCH_MAXH
-    global USE_CAMERA_THREAD, USE_RTSP_THREAD
-    global CAMERA_INDEX
+def _save_settings(path: str, data: dict) -> None:
     try:
-        import json
-
-        data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return
-    try:
-        CURRENT_PEOPLE_LIMIT = _clamp(int(data.get("people_limit", CURRENT_PEOPLE_LIMIT)), PEOPLE_LIMIT_OPTIONS[0], PEOPLE_LIMIT_OPTIONS[-1])
-    except Exception:
-        pass
-    try:
-        BLUR_KERNEL_IDX = _clamp(int(data.get("blur_kernel_idx", BLUR_KERNEL_IDX)), 0, len(BLUR_KERNEL_OPTIONS) - 1)
-    except Exception:
-        pass
-    try:
-        BLUR_ENABLED = bool(data.get("blur_enabled", BLUR_ENABLED))
-    except Exception:
-        pass
-    try:
-        MASK_THRESH = _clamp(int(data.get("mask_thresh", MASK_THRESH)), 0, 255)
-    except Exception:
-        pass
-    try:
-        IMG_SIZE_IDX = _clamp(int(data.get("img_size_idx", IMG_SIZE_IDX)), 0, len(IMG_SIZE_OPTIONS) - 1)
-    except Exception:
-        pass
-    try:
-        HIGH_PRECISION_MODE = bool(data.get("high_precision_mode", HIGH_PRECISION_MODE))
-    except Exception:
-        pass
-    try:
-        if data.get("ndi_output_mask") in {"soft", "detail"}:
-            NDI_OUTPUT_MASK = data["ndi_output_mask"]
-    except Exception:
-        pass
-    try:
-        ENABLE_NDI_INPUT = bool(data.get("ndi_input_enabled", ENABLE_NDI_INPUT))
-    except Exception:
-        pass
-    try:
-        ENABLE_NDI_OUTPUT = bool(data.get("ndi_output_enabled", ENABLE_NDI_OUTPUT))
-    except Exception:
-        pass
-    try:
-        ENABLE_NDI_TRANSLATIONS_OUTPUT = bool(
-            data.get("ndi_translations_output_enabled", ENABLE_NDI_TRANSLATIONS_OUTPUT)
-        )
-    except Exception:
-        pass
-    try:
-        src = str(data.get("source", CURRENT_SOURCE)).lower()
-        if src in {"camera", "video", "ndi"}:
-            CURRENT_SOURCE = src
-    except Exception:
-        pass
-    try:
-        SHOW_DETAIL = bool(data.get("show_detail", SHOW_DETAIL_DEFAULT))
-    except Exception:
-        pass
-    try:
-        FLIP_INPUT = bool(data.get("flip_input", FLIP_INPUT))
-    except Exception:
-        pass
-    try:
-        ENABLE_RTSP_INPUT = bool(data.get("rtsp_input_enabled", ENABLE_RTSP_INPUT))
-    except Exception:
-        pass
-    try:
-        url = str(data.get("rtsp_url", RTSP_URL)).strip()
-        if url:
-            RTSP_URL = url
-    except Exception:
-        pass
-    try:
-        cam_idx = int(data.get("camera_index", CAMERA_INDEX))
-        if 0 <= cam_idx <= CAMERA_MAX_INDEX:
-            CAMERA_INDEX = cam_idx
-    except Exception:
-        pass
-    try:
-        osc_ip = str(data.get("osc_ip", OSC_IP)).strip()
-        if osc_ip:
-            OSC_IP = osc_ip
-    except Exception:
-        pass
-    try:
-        osc_port = int(data.get("osc_port", OSC_PORT))
-        if 1 <= osc_port <= 65535:
-            OSC_PORT = osc_port
-    except Exception:
-        pass
-    try:
-        OSC_ENABLED = bool(data.get("osc_enabled", OSC_ENABLED))
-    except Exception:
-        pass
-    try:
-        val = int(data.get("process_every_n", PROCESS_EVERY_N))
-        if val in PROCESS_EVERY_OPTIONS:
-            PROCESS_EVERY_N = val
-    except Exception:
-        pass
-    try:
-        val = int(data.get("camera_fps", CAMERA_FPS))
-        if val in CAM_FPS_OPTIONS:
-            CAMERA_FPS = val
-    except Exception:
-        pass
-    try:
-        fourcc = str(data.get("camera_fourcc", CAMERA_FOURCC)).strip().upper()
-        if fourcc in CAM_FOURCC_OPTIONS:
-            CAMERA_FOURCC = fourcc
-    except Exception:
-        pass
-    try:
-        cam_res = int(data.get("camera_res_h", CAMERA_REQ_HEIGHT))
-        if cam_res in CAM_RES_OPTIONS:
-            CAMERA_REQ_HEIGHT = cam_res
-            CAMERA_REQ_WIDTH = int(cam_res * 16 / 9) if cam_res > 0 else 0
-            CAMERA_MATCH_MAXH = cam_res == 0
-    except Exception:
-        pass
-    try:
-        USE_CAMERA_THREAD = bool(data.get("camera_thread", USE_CAMERA_THREAD))
-    except Exception:
-        pass
-    try:
-        USE_RTSP_THREAD = bool(data.get("rtsp_thread", USE_RTSP_THREAD))
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=True, indent=2)
     except Exception:
         pass
 
 
-def save_settings(extra: dict[str, Any] | None = None):
-    base = {
-        "people_limit": CURRENT_PEOPLE_LIMIT,
-        "blur_kernel_idx": BLUR_KERNEL_IDX,
-        "blur_enabled": BLUR_ENABLED,
-        "mask_thresh": MASK_THRESH,
-        "img_size_idx": IMG_SIZE_IDX,
-        "high_precision_mode": HIGH_PRECISION_MODE,
-        "ndi_output_mask": NDI_OUTPUT_MASK,
-        "ndi_input_enabled": ENABLE_NDI_INPUT,
-        "ndi_output_enabled": ENABLE_NDI_OUTPUT,
-        "ndi_translations_output_enabled": ENABLE_NDI_TRANSLATIONS_OUTPUT,
-        "rtsp_input_enabled": ENABLE_RTSP_INPUT,
-        "rtsp_url": RTSP_URL,
-        "camera_index": CAMERA_INDEX,
-        "osc_ip": OSC_IP,
-        "osc_port": OSC_PORT,
-        "osc_enabled": OSC_ENABLED,
-        "process_every_n": PROCESS_EVERY_N,
-        "camera_fps": CAMERA_FPS,
-        "camera_fourcc": CAMERA_FOURCC,
-        "camera_res_h": CAMERA_REQ_HEIGHT if not CAMERA_MATCH_MAXH else 0,
-        "camera_thread": USE_CAMERA_THREAD,
-        "rtsp_thread": USE_RTSP_THREAD,
-        "source": CURRENT_SOURCE,
-        "show_detail": SHOW_DETAIL,
-        "flip_input": FLIP_INPUT,
-    }
-    if extra:
-        base.update(extra)
-    try:
-        import json
-
-        SETTINGS_FILE.write_text(json.dumps(base, indent=2), encoding="utf-8")
-    except Exception:
-        pass
-
-
-class InferenceWorker:
-    def __init__(self, model_path: str):
-        self.desired_model_path = model_path
-        self.loaded_model_path = model_path
-        self.model = load_model(model_path)
-        self.frame_lock = threading.Lock()
-        self.result_lock = threading.Lock()
-        self.event = threading.Event()
-        self.stop_event = threading.Event()
-        self.pending = None
-        self.result = None
-        self.result_seq = 0
-        self.thread = threading.Thread(target=self._loop, daemon=True)
-        self.thread.start()
-
-    def update_frame(self, frame: np.ndarray, settings: dict[str, Any]) -> None:
-        with self.frame_lock:
-            self.pending = (frame, settings)
-        self.event.set()
-
-    def set_model_path(self, model_path: str) -> None:
-        with self.frame_lock:
-            self.desired_model_path = model_path
-        self.event.set()
-
-    def get_latest(self) -> Tuple[Any, int]:
-        with self.result_lock:
-            return self.result, self.result_seq
-
-    def stop(self) -> None:
-        self.stop_event.set()
-        self.event.set()
-        self.thread.join(timeout=1.0)
-
-    def _maybe_reload(self) -> None:
-        if self.desired_model_path == self.loaded_model_path:
-            return
-        self.model = load_model(self.desired_model_path)
-        self.loaded_model_path = self.desired_model_path
-
-    def _loop(self) -> None:
-        while not self.stop_event.is_set():
-            self.event.wait(0.01)
-            if self.stop_event.is_set():
-                break
-            with self.frame_lock:
-                req = self.pending
-                self.pending = None
-            self.event.clear()
-            if req is None:
-                self._maybe_reload()
-                continue
-            self._maybe_reload()
-            frame, settings = req
-            masks = segment_people(
-                frame,
-                self.model,
-                settings["people_limit"],
-                settings["mask_thresh"],
-                settings["blur_enabled"],
-                compute_person_masks=settings["compute_person_masks"],
-            )
-            with self.result_lock:
-                self.result = masks
-                self.result_seq += 1
-
-
-class LatestFrameCapture:
-    """Background reader that always exposes the latest frame (low-latency)."""
-
-    def __init__(self, cap: cv2.VideoCapture, grab_skip: int = 0):
-        self.cap = cap
-        self.grab_skip = max(0, int(grab_skip))
-        self.lock = threading.Lock()
-        self.frame = None
-        self.new = False
-        self.stop_event = threading.Event()
-        self.thread = threading.Thread(target=self._loop, daemon=True)
-        self.thread.start()
-
-    def _loop(self) -> None:
-        while not self.stop_event.is_set():
-            if self.grab_skip > 0:
-                ok = self.cap.grab()
-                if not ok:
-                    time.sleep(0.005)
-                    continue
-                for _ in range(self.grab_skip):
-                    if not self.cap.grab():
-                        break
-                ok, frame = self.cap.retrieve()
-            else:
-                ok, frame = self.cap.read()
-            if not ok:
-                time.sleep(0.005)
-                continue
-            with self.lock:
-                self.frame = frame
-                self.new = True
-
-    def read_latest(self):
-        with self.lock:
-            frame = self.frame
-            is_new = self.new
-            self.new = False
-        return frame, is_new
-
-    def isOpened(self):
-        return self.cap is not None and self.cap.isOpened()
-
-    def get(self, prop):
-        if self.cap is None:
-            return 0
-        try:
-            return self.cap.get(prop)
-        except Exception:
-            return 0
-
-    def release(self):
-        self.stop_event.set()
-        self.thread.join(timeout=1.5)
-        if self.thread.is_alive():
-            return
-        if self.cap is not None:
-            try:
-                self.cap.release()
-            except Exception:
-                pass
-
-
-# --------------- Syphon (opcional) ----------------------------------
-class SyphonPublisher:
-    """Wrapper para publicar frames por Syphon si la librería está disponible."""
-
-    def __init__(self, name: str):
-        self.server = None
-        self.name = name
-
-    def publish(self, frame: np.ndarray):
-        return
-
-
-class NDIPublisher:
-    """Wrapper para publicar frames por NDI si la librería está disponible."""
-
-    def __init__(self, name: str):
-        self.name = name
-        self.ndi = None
-        self.sender = None
-        self.ready = False
-        self._announced = False
-        self.vf = None
-        if not ENABLE_NDI:
-            return
-        try:
-            ndi = get_ndi_module()
-            if ndi is None or not hasattr(ndi, "Sender"):
-                raise RuntimeError("No se pudo importar cyndilib Sender")
-
-            self.ndi = ndi
-            self.sender = ndi.Sender(ndi_name=name)
-        except Exception as exc:
-            print(f"[NDI] No disponible: {exc}", file=sys.stderr)
-            self.sender = None
-            self.ndi = None
-
-    def publish(self, frame: np.ndarray):
-        if self.sender is None or self.ndi is None:
-            return
-        try:
-            ndi = self.ndi
-            VideoSendFrame = ndi.video_frame.VideoSendFrame if hasattr(ndi, "video_frame") else None
-            # Convertimos a BGRA para NDI.
-            if frame.ndim == 2:
-                frame_bgra = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGRA)
-            else:
-                frame_bgra = cv2.cvtColor(frame, cv2.COLOR_BGR2BGRA)
-            if not frame_bgra.flags["C_CONTIGUOUS"]:
-                frame_bgra = frame_bgra.copy()
-
-            h, w = frame_bgra.shape[:2]
-            # Inicializar VideoSendFrame si hace falta o si cambia la resolución.
-            if self.vf is None or self.vf.get_resolution() != (w, h):
-                if VideoSendFrame is None:
-                    print("[NDI] cyndilib sin VideoSendFrame; no se envía.", file=sys.stderr)
-                    return
-                if self.ready:
-                    # Si el sender está abierto y cambia la resolución, cerrar y reconfigurar.
-                    try:
-                        self.sender.close()
-                    except Exception:
-                        pass
-                    self.ready = False
-                vf = VideoSendFrame()
-                vf.set_resolution(w, h)
-                vf.set_fourcc(ndi.FourCC.BGRA)
-                # Usa 60fps como valor por defecto; NDI ajusta internamente.
-                vf.set_frame_rate(Fraction(60, 1))
-                self.sender.set_video_frame(vf)
-                self.vf = vf
-                if not self.ready:
-                    # Abrimos el sender una vez tengamos frame configurado.
-                    self.sender.open()
-                    self.ready = True
-            # write_video_async admite memoryview 1D
-            self.sender.write_video_async(frame_bgra.ravel(order="C"))
-            if not self._announced:
-                print(f"[NDI] Enviando salida NDI '{self.name}' ({w}x{h})", file=sys.stderr)
-                self._announced = True
-        except Exception as exc:
-            print(f"[NDI] Error al publicar: {exc}", file=sys.stderr)
-
-
-class NDIReceiver:
-    """Wrapper para recibir frames por NDI."""
-
-    def __init__(self, source_name: str | None = None):
-        self.ndi = None
-        self.recv = None
-        self.ready = False
-        self.source_name = source_name
-        if not ENABLE_NDI:
-            return
-        try:
-            ndi = get_ndi_module()
-            if ndi is None or not hasattr(ndi, "Receiver"):
-                raise RuntimeError("No se pudo importar cyndilib Receiver")
-
-            finder = ndi.Finder()
-            finder.open()
-            finder.wait_for_sources(2.0)
-            sources = list(finder.iter_sources())
-            finder.close()
-
-            if not sources:
-                print("[NDI] No se encontraron fuentes NDI.", file=sys.stderr)
-                return
-
-            preferred = (source_name or "").lower().strip()
-            selected = None
-            for src in sources:
-                name = getattr(src, "name", "") or getattr(src, "stream_name", "") or ""
-                if preferred and preferred in name.lower():
-                    selected = src
-                    break
-            if selected is None:
-                selected = sources[0]
-
-            self.recv = ndi.Receiver(
-                source_name=getattr(selected, "name", ""),
-                color_format=ndi.RecvColorFormat.BGRX_BGRA,
-                bandwidth=ndi.RecvBandwidth.highest,
-                allow_video_fields=False,
-                recv_name="NEXT2-Recv",
-            )
-            # Usar FrameSync para simplificar la lectura de vídeo.
-            vf_sync = ndi.video_frame.VideoFrameSync()
-            self.recv.frame_sync.set_video_frame(vf_sync)
-            self.recv.connect_to(selected)
-            try:
-                self.recv._wait_for_connect(2.0)
-            except Exception:
-                pass
-            self.ndi = ndi
-            self.ready = True
-            print(f"[NDI] Conectado a '{getattr(selected, 'name', 'NDI')}'", file=sys.stderr)
-        except Exception as exc:
-            print(f"[NDI] No se pudo preparar la entrada NDI: {exc}", file=sys.stderr)
-            self.ndi = None
-            self.recv = None
-            self.ready = False
-
-    def capture(self):
-        """Returns BGR frame or None if not available."""
-        if not self.ready or self.recv is None or self.ndi is None:
-            return None
-        ndi = self.ndi
-        try:
-            fs = self.recv.frame_sync
-            fs.capture_video()
-            vf = fs.video_frame
-            w, h = vf.get_resolution()
-            stride = vf.get_line_stride()
-            mv = memoryview(vf)
-            flat = np.frombuffer(mv, dtype=np.uint8).copy()
-            mv.release()
-            if flat.size < stride * h or w <= 0 or h <= 0:
-                return None
-            frame_bgra = flat[: stride * h].reshape((h, stride))[:, : w * 4].reshape((h, w, 4))
-            frame_bgr = frame_bgra[:, :, :3].copy()
-            return frame_bgr
-        except Exception as exc:
-            print(f"[NDI] Error al recibir: {exc}", file=sys.stderr)
-            return None
-
-    def release(self):
-        # No-op for NDI receiver; placeholder for interface compatibility.
-        return
-
-
-# --------------- OSC helpers --------------------------------------
-def _osc_pad(data: bytes) -> bytes:
-    pad = (4 - (len(data) % 4)) % 4
-    return data + (b"\x00" * pad)
-
-
-def _osc_encode_str(text: str) -> bytes:
-    return _osc_pad(text.encode("ascii", errors="ignore") + b"\x00")
-
-
-class OSCSender:
-    """Minimal OSC UDP sender (ints/floats only) for efficiency."""
-
-    def __init__(self, ip: str, port: int):
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.addr = (ip, port)
-        self.enabled = True
-
-    def update_target(self, ip: str, port: int) -> None:
-        self.addr = (ip, port)
-
-    def send(self, address: str, *args: Any) -> None:
-        if not self.enabled:
-            return
-        try:
-            types = ","
-            payload = b""
-            for arg in args:
-                if isinstance(arg, float):
-                    types += "f"
-                    payload += struct.pack(">f", float(arg))
-                else:
-                    types += "i"
-                    payload += struct.pack(">i", int(arg))
-            msg = _osc_encode_str(address) + _osc_encode_str(types) + payload
-            self.sock.sendto(msg, self.addr)
-        except Exception:
-            pass
-
-
-# --------------- loop principal ------------------------------------
-def main():
-    # Carga modelo YOLOv8 de segmentación (usa uno ligero por defecto).
-    model_path = "yolov8n-seg.pt"
-    global DEVICE, CURRENT_MODEL_PATH, CURRENT_MODEL_KEY, CURRENT_PEOPLE_LIMIT, CURRENT_SOURCE
-    global BLUR_KERNEL_IDX, MASK_THRESH, BLUR_ENABLED, IMG_SIZE_IDX, HIGH_PRECISION_MODE, ENABLE_NDI, DEFAULT_SOURCE, SHOW_DETAIL, FLIP_INPUT
-    global ENABLE_NDI_INPUT, ENABLE_NDI_OUTPUT, ENABLE_NDI_TRANSLATIONS_OUTPUT, ENABLE_RTSP_INPUT
-    global UI_PENDING_MODEL_KEY, UI_PENDING_SOURCE, VIEW_HITBOXES, ROI_PANEL_BOUNDS, ROI_PANEL_BOUNDS_ABS
-    global MASK_ROI_PANEL_BOUNDS, MASK_ROI_PANEL_BOUNDS_ABS, MASK_PANEL_FIT
-    global FOOTER_CACHE, FOOTER_CACHE_KEY, FOOTER_CACHE_HITBOXES, UI_HITBOXES
-    global CAMERA_INDEX, CAMERA_INDEX_CHANGED
-    load_saved_resolution()
-    load_saved_model()
-    load_settings()
-    env_device = os.environ.get("NEXT_DEVICE", "").strip().lower()
-    if env_device and env_device != "auto":
-        # Permite forzar cpu/mps/cuda manualmente.
-        DEVICE = env_device
-    else:
-        # Auto: intenta mps -> cuda -> cpu.
-        if torch.backends.mps.is_available():
-            DEVICE = "mps"
-        elif torch.cuda.is_available():
-            DEVICE = "cuda"
-        else:
-            DEVICE = "cpu"
-
-    env_source = os.environ.get("NEXT_SOURCE", "").strip().lower()
-    # Probar NDI en proceso aislado para evitar segfault en main.
-    ndi_ok = False
-    if ENABLE_NDI:
-        ndi_ok = probe_ndi_available()
-        if not ndi_ok:
-            print("[NDI] No se pudo inicializar NDIlib.", file=sys.stderr)
-            # No forzamos el apagado global para permitir reactivar salida NDI manualmente.
-
-    # Decide fuente por env o por disponibilidad (por defecto cámara; NDI se selecciona a mano).
-    if env_source in {"ndi", "camera", "video", "rtsp"}:
-        CURRENT_SOURCE = env_source
-    else:
-        CURRENT_SOURCE = "camera"
-
-    if CURRENT_SOURCE == "ndi" and (not ENABLE_NDI or not ENABLE_NDI_INPUT):
-        print("[NDI] Fuente NDI solicitada pero NDI no está disponible, usando cámara.", file=sys.stderr)
-        CURRENT_SOURCE = "camera"
-    if CURRENT_SOURCE == "rtsp" and (not ENABLE_RTSP_INPUT or not RTSP_URL):
-        print("[RTSP] Fuente RTSP solicitada pero no está disponible, usando cámara.", file=sys.stderr)
-        CURRENT_SOURCE = "camera"
-
-    infer_worker = None
-    model = None
-    if USE_INFERENCE_THREAD:
-        try:
-            infer_worker = InferenceWorker(CURRENT_MODEL_PATH)
-        except Exception as exc:
-            print(f"No se pudo cargar el modelo {CURRENT_MODEL_PATH}: {exc}", file=sys.stderr)
-            return 1
-    else:
-        try:
-            model = load_model(CURRENT_MODEL_PATH)
-        except Exception as exc:
-            print(f"No se pudo cargar el modelo {CURRENT_MODEL_PATH}: {exc}", file=sys.stderr)
-            return 1
-
-    cap = open_capture(CURRENT_SOURCE)
-    if not capture_ready(cap):
-        print("No se pudo abrir la fuente de video.", file=sys.stderr)
-        return 1
-
-    prev_time = time.time()
-    window_name = "NEXT2 VISION - ROTOR STUDIO"
-    canvas_size = (CANVAS_WIDTH, CANVAS_HEIGHT)  # width, height (3 panels + gap)
-    header_h = 40
-    footer_h = FOOTER_HEIGHT
-    cv2.setUseOptimized(True)
-    cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE | cv2.WINDOW_GUI_NORMAL)
-    cv2.setMouseCallback(window_name, on_mouse)
-    frame_idx = 0
-    last_mask_soft = None
-    last_mask_detail = None
-    last_boxes = None
-    last_boxed = None
-    last_person_masks = []
-    last_frame = None
-    last_rtsp_frame_time = time.time()
-    last_mask_to_show = None
-    cached_middle_view = None
-    cached_middle_key = None
-    cached_translated = None
-    cached_mask_roi_masks = None
-    cached_mask_roi_key = None
-    cached_left_view = None
-    cached_left_key = None
-    cached_left_labeled = None
-    cached_left_labeled_key = None
-    cached_right_bgr = None
-    cached_right_key = None
-    persist_mask = None
-    last_detect_time = None
-    last_detect_mask = None
-    show_detail = SHOW_DETAIL
-    ndi_pub = NDIPublisher("NEXT2 Mask NDI") if ENABLE_NDI and ENABLE_NDI_OUTPUT else None
-    ndi_trans_pub = (
-        NDIPublisher("NEXT2 Translations NDI") if ENABLE_NDI and ENABLE_NDI_TRANSLATIONS_OUTPUT else None
+def _draw_button(
+    canvas: np.ndarray, label: str, rect: Tuple[int, int, int, int], active: bool
+) -> None:
+    x1, y1, x2, y2 = rect
+    fill = (70, 70, 70) if not active else (0, 120, 80)
+    cv2.rectangle(canvas, (x1, y1), (x2, y2), fill, thickness=-1)
+    cv2.rectangle(canvas, (x1, y1), (x2, y2), (180, 180, 180), thickness=1)
+    cv2.putText(
+        canvas,
+        label,
+        (x1 + 10, y2 - 8),
+        UI_FONT,
+        UI_FONT_SCALE,
+        (230, 230, 230),
+        UI_TEXT_THICKNESS,
+        lineType=cv2.LINE_8,
     )
-    osc_sender = OSCSender(OSC_IP, OSC_PORT)
-    last_osc_target = (OSC_IP, OSC_PORT)
-    last_osc_time = 0.0
-    last_osc_people = None
-    last_osc_masks = None
-    osc_sender.enabled = OSC_ENABLED
 
-    last_result_seq = 0
+
+def _draw_ui(canvas: np.ndarray, ui: UIState, start_x: int) -> None:
+    y = UI_TOP_MARGIN
+    ui.rects = {}
+
+    res_label = RES_OPTIONS[ui.selected_res][0] if RES_OPTIONS else "N/A"
+    cv2.putText(
+        canvas,
+        "RES",
+        (start_x, y + 12),
+        UI_FONT,
+        UI_FONT_SCALE,
+        (200, 200, 200),
+        UI_TEXT_THICKNESS,
+        lineType=cv2.LINE_8,
+    )
+    y += UI_SECTION_GAP
+    x = start_x
+    for idx, (label, _, _) in enumerate(RES_OPTIONS):
+        rect = (x, y, x + UI_BTN_W, y + UI_BTN_H)
+        ui.rects[f"res_{idx}"] = rect
+        _draw_button(canvas, label, rect, idx == ui.selected_res)
+        x += UI_BTN_W + UI_BTN_GAP
+    y += UI_BTN_H + UI_SECTION_GAP
+
+    cv2.putText(
+        canvas,
+        "MODEL",
+        (start_x, y + 12),
+        UI_FONT,
+        UI_FONT_SCALE,
+        (200, 200, 200),
+        UI_TEXT_THICKNESS,
+        lineType=cv2.LINE_8,
+    )
+    y += UI_SECTION_GAP
+    x = start_x
+    for idx, (label, _) in enumerate(MODEL_OPTIONS):
+        rect = (x, y, x + UI_BTN_W, y + UI_BTN_H)
+        ui.rects[f"model_{idx}"] = rect
+        _draw_button(canvas, label, rect, idx == ui.selected_model)
+        x += UI_BTN_W + UI_BTN_GAP
+    y += UI_BTN_H + UI_SECTION_GAP
+
+    cv2.putText(
+        canvas,
+        f"LIMIT | {ui.person_limit:02d} | Detected: {ui.persons_detected:02d}",
+        (start_x, y + 12),
+        UI_FONT,
+        UI_FONT_SCALE,
+        (200, 200, 200),
+        UI_TEXT_THICKNESS,
+        lineType=cv2.LINE_8,
+    )
+    y += UI_SECTION_GAP
+    slider_w = UI_BTN_W * 2 + UI_BTN_GAP
+    slider_h = 10
+    rect = (start_x, y, start_x + slider_w, y + slider_h)
+    ui.rects["slider"] = rect
+    cv2.rectangle(canvas, (rect[0], rect[1]), (rect[2], rect[3]), (80, 80, 80), -1)
+    cv2.rectangle(canvas, (rect[0], rect[1]), (rect[2], rect[3]), (140, 140, 140), 1)
+    if MAX_PERSON_LIMIT > 0:
+        ratio = ui.person_limit / float(MAX_PERSON_LIMIT)
+    else:
+        ratio = 0.0
+    knob_x = rect[0] + int(ratio * slider_w)
+    cv2.rectangle(
+        canvas,
+        (knob_x - 4, rect[1] - 4),
+        (knob_x + 4, rect[3] + 4),
+        (0, 140, 120),
+        -1,
+    )
+    y += slider_h + UI_SECTION_GAP
+
+    cv2.putText(
+        canvas,
+        f"SKIP | {ui.skip_frames}",
+        (start_x, y + 12),
+        UI_FONT,
+        UI_FONT_SCALE,
+        (200, 200, 200),
+        UI_TEXT_THICKNESS,
+        lineType=cv2.LINE_8,
+    )
+    y += UI_SECTION_GAP
+    slider_w = UI_BTN_W * 2 + UI_BTN_GAP
+    slider_h = 10
+    rect = (start_x, y, start_x + slider_w, y + slider_h)
+    ui.rects["skip_slider"] = rect
+    cv2.rectangle(canvas, (rect[0], rect[1]), (rect[2], rect[3]), (80, 80, 80), -1)
+    cv2.rectangle(canvas, (rect[0], rect[1]), (rect[2], rect[3]), (140, 140, 140), 1)
+    if MAX_SKIP_FRAMES > 0:
+        ratio = ui.skip_frames / float(MAX_SKIP_FRAMES)
+    else:
+        ratio = 0.0
+    knob_x = rect[0] + int(ratio * slider_w)
+    cv2.rectangle(
+        canvas,
+        (knob_x - 4, rect[1] - 4),
+        (knob_x + 4, rect[3] + 4),
+        (0, 140, 120),
+        -1,
+    )
+    y += slider_h + UI_SECTION_GAP
+
+    cv2.putText(
+        canvas,
+        f"CONF | {ui.conf:.2f}",
+        (start_x, y + 12),
+        UI_FONT,
+        UI_FONT_SCALE,
+        (200, 200, 200),
+        UI_TEXT_THICKNESS,
+        lineType=cv2.LINE_8,
+    )
+    y += UI_SECTION_GAP
+    slider_w = UI_BTN_W * 2 + UI_BTN_GAP
+    slider_h = 10
+    rect = (start_x, y, start_x + slider_w, y + slider_h)
+    ui.rects["conf_slider"] = rect
+    cv2.rectangle(canvas, (rect[0], rect[1]), (rect[2], rect[3]), (80, 80, 80), -1)
+    cv2.rectangle(canvas, (rect[0], rect[1]), (rect[2], rect[3]), (140, 140, 140), 1)
+    conf_range = max(0.0001, CONF_MAX - CONF_MIN)
+    ratio = (ui.conf - CONF_MIN) / conf_range
+    ratio = min(1.0, max(0.0, ratio))
+    knob_x = rect[0] + int(ratio * slider_w)
+    cv2.rectangle(
+        canvas,
+        (knob_x - 4, rect[1] - 4),
+        (knob_x + 4, rect[3] + 4),
+        (0, 140, 120),
+        -1,
+    )
+    y += slider_h + UI_SECTION_GAP
+
+    imgsz_val = IMG_SIZES[ui.imgsz_idx] if IMG_SIZES else YOLO_IMGSZ
+    cv2.putText(
+        canvas,
+        f"IMGSZ | {imgsz_val}",
+        (start_x, y + 12),
+        UI_FONT,
+        UI_FONT_SCALE,
+        (200, 200, 200),
+        UI_TEXT_THICKNESS,
+        lineType=cv2.LINE_8,
+    )
+    y += UI_SECTION_GAP
+    rect = (start_x, y, start_x + slider_w, y + slider_h)
+    ui.rects["imgsz_slider"] = rect
+    cv2.rectangle(canvas, (rect[0], rect[1]), (rect[2], rect[3]), (80, 80, 80), -1)
+    cv2.rectangle(canvas, (rect[0], rect[1]), (rect[2], rect[3]), (140, 140, 140), 1)
+    if IMG_SIZES:
+        ratio = ui.imgsz_idx / float(max(1, len(IMG_SIZES) - 1))
+    else:
+        ratio = 0.0
+    knob_x = rect[0] + int(ratio * slider_w)
+    cv2.rectangle(
+        canvas,
+        (knob_x - 4, rect[1] - 4),
+        (knob_x + 4, rect[3] + 4),
+        (0, 140, 120),
+        -1,
+    )
+    y += slider_h + UI_SECTION_GAP
+
+    cv2.putText(
+        canvas,
+        f"MASK BLUR | {ui.blur}",
+        (start_x, y + 12),
+        UI_FONT,
+        UI_FONT_SCALE,
+        (200, 200, 200),
+        UI_TEXT_THICKNESS,
+        lineType=cv2.LINE_8,
+    )
+    y += UI_SECTION_GAP
+    rect = (start_x, y, start_x + slider_w, y + slider_h)
+    ui.rects["blur_slider"] = rect
+    cv2.rectangle(canvas, (rect[0], rect[1]), (rect[2], rect[3]), (80, 80, 80), -1)
+    cv2.rectangle(canvas, (rect[0], rect[1]), (rect[2], rect[3]), (140, 140, 140), 1)
+    blur_max = MAX_MASK_BLUR
+    ratio = min(1.0, max(0.0, ui.blur / float(blur_max)))
+    knob_x = rect[0] + int(ratio * slider_w)
+    cv2.rectangle(
+        canvas,
+        (knob_x - 4, rect[1] - 4),
+        (knob_x + 4, rect[3] + 4),
+        (0, 140, 120),
+        -1,
+    )
+    y += slider_h + UI_SECTION_GAP
+
+    cv2.putText(
+        canvas,
+        f"MASK MORPH | {ui.morph}",
+        (start_x, y + 12),
+        UI_FONT,
+        UI_FONT_SCALE,
+        (200, 200, 200),
+        UI_TEXT_THICKNESS,
+        lineType=cv2.LINE_8,
+    )
+    y += UI_SECTION_GAP
+    rect = (start_x, y, start_x + slider_w, y + slider_h)
+    ui.rects["morph_slider"] = rect
+    cv2.rectangle(canvas, (rect[0], rect[1]), (rect[2], rect[3]), (80, 80, 80), -1)
+    cv2.rectangle(canvas, (rect[0], rect[1]), (rect[2], rect[3]), (140, 140, 140), 1)
+    morph_range = max(1, MAX_MORPH)
+    ratio = (ui.morph + morph_range) / float(morph_range * 2)
+    ratio = min(1.0, max(0.0, ratio))
+    knob_x = rect[0] + int(ratio * slider_w)
+    cv2.rectangle(
+        canvas,
+        (knob_x - 4, rect[1] - 4),
+        (knob_x + 4, rect[3] + 4),
+        (0, 140, 120),
+        -1,
+    )
+    y += slider_h + UI_SECTION_GAP
+
+
+def main() -> int:
+    cv2.setUseOptimized(True)
+    try:
+        cv2.setNumThreads(max(1, int(os.environ.get("NEXT_CV_THREADS", "2"))))
+    except Exception:
+        pass
+
+    model_path = YOLO_MODEL_PATH
+    model = _load_model(model_path)
+    if model is None:
+        fallback = "yolov8n.pt"
+        model = _load_model(fallback)
+        if model is not None:
+            model_path = fallback
+
+    device = YOLO_DEVICE
+    if not device:
+        try:
+            import torch
+
+            if torch.backends.mps.is_available():
+                device = "mps"
+            else:
+                device = "cpu"
+        except Exception:
+            device = "cpu"
+
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE | cv2.WINDOW_GUI_NORMAL)
+    ui = UIState()
+    settings = _load_settings(SETTINGS_PATH)
+    cam_index = max(0, int(settings.get("cam_index", 0)))
+    if "selected_res" in settings:
+        ui.selected_res = int(settings.get("selected_res", ui.selected_res))
+    if "selected_model" in settings:
+        ui.selected_model = int(settings.get("selected_model", ui.selected_model))
+    if "person_limit" in settings:
+        ui.person_limit = int(settings.get("person_limit", ui.person_limit))
+    if "skip_frames" in settings:
+        ui.skip_frames = int(settings.get("skip_frames", ui.skip_frames))
+    if "conf" in settings:
+        ui.conf = float(settings.get("conf", ui.conf))
+    if "imgsz_idx" in settings:
+        ui.imgsz_idx = int(settings.get("imgsz_idx", ui.imgsz_idx))
+    if "blur" in settings:
+        ui.blur = int(settings.get("blur", ui.blur))
+    if "morph" in settings:
+        ui.morph = int(settings.get("morph", ui.morph))
+
+    cap, cam_index = _cycle_camera(cam_index)
+    if cap is None:
+        print("[CAM] No cameras available.", file=sys.stderr)
+    for idx, (_, w, h) in enumerate(RES_OPTIONS):
+        if w == CAM_WIDTH and h == CAM_HEIGHT:
+            if "selected_res" not in settings:
+                ui.selected_res = idx
+            break
+    for idx, (_, path) in enumerate(MODEL_OPTIONS):
+        if path == model_path and "selected_model" not in settings:
+            ui.selected_model = idx
+            break
+    if IMG_SIZES:
+        if "imgsz_idx" not in settings:
+            closest = min(range(len(IMG_SIZES)), key=lambda i: abs(IMG_SIZES[i] - YOLO_IMGSZ))
+            ui.imgsz_idx = closest
+
+    last_frame_time = time.time()
+    prev_time = time.time()
+    fps = 0.0
+
+    def apply_resolution(idx: int) -> None:
+        nonlocal cap
+        global CAM_WIDTH, CAM_HEIGHT
+        ui.selected_res = idx
+        _, w, h = RES_OPTIONS[idx]
+        CAM_WIDTH, CAM_HEIGHT = w, h
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception:
+                pass
+        cap, _ = _cycle_camera(cam_index)
+        if cap is not None:
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+
+    worker: Optional[YoloWorker] = None
+
+    def reset_worker() -> None:
+        nonlocal worker
+        if worker is not None:
+            worker.stop()
+            worker = None
+        if model is not None:
+            imgsz_val = IMG_SIZES[ui.imgsz_idx] if IMG_SIZES else YOLO_IMGSZ
+            worker = YoloWorker(model, device, ui.conf, imgsz_val)
+
+    reset_worker()
+
+    def apply_model(idx: int) -> None:
+        nonlocal model, model_path
+        ui.selected_model = idx
+        _, path = MODEL_OPTIONS[idx]
+        model_path = path
+        model = _load_model(model_path)
+        if model is None:
+            print("[YOLO] Modelo no disponible.", file=sys.stderr)
+            reset_worker()
+            return
+        reset_worker()
+
+    if IMG_SIZES:
+        ui.imgsz_idx = max(0, min(ui.imgsz_idx, len(IMG_SIZES) - 1))
+    if "selected_res" in settings and 0 <= ui.selected_res < len(RES_OPTIONS):
+        apply_resolution(ui.selected_res)
+    if "selected_model" in settings and 0 <= ui.selected_model < len(MODEL_OPTIONS):
+        apply_model(ui.selected_model)
+
+    def on_mouse(event: int, x: int, y: int, flags: int, param: object) -> None:
+        if event == cv2.EVENT_LBUTTONDOWN:
+            for idx in range(len(RES_OPTIONS)):
+                rect = ui.rects.get(f"res_{idx}")
+                if rect and rect[0] <= x <= rect[2] and rect[1] <= y <= rect[3]:
+                    apply_resolution(idx)
+                    mark_dirty()
+                    return
+            for idx in range(len(MODEL_OPTIONS)):
+                rect = ui.rects.get(f"model_{idx}")
+                if rect and rect[0] <= x <= rect[2] and rect[1] <= y <= rect[3]:
+                    apply_model(idx)
+                    mark_dirty()
+                    return
+            rect = ui.rects.get("slider")
+            if rect and rect[0] <= x <= rect[2] and rect[1] <= y <= rect[3]:
+                ui.slider_drag = True
+                if rect[2] > rect[0]:
+                    ratio = (x - rect[0]) / float(rect[2] - rect[0])
+                    ui.person_limit = int(round(ratio * MAX_PERSON_LIMIT))
+                    mark_dirty()
+                return
+            rect = ui.rects.get("skip_slider")
+            if rect and rect[0] <= x <= rect[2] and rect[1] <= y <= rect[3]:
+                ui.skip_drag = True
+                if rect[2] > rect[0]:
+                    ratio = (x - rect[0]) / float(rect[2] - rect[0])
+                    ui.skip_frames = int(round(ratio * MAX_SKIP_FRAMES))
+                    mark_dirty()
+                return
+            rect = ui.rects.get("conf_slider")
+            if rect and rect[0] <= x <= rect[2] and rect[1] <= y <= rect[3]:
+                ui.conf_drag = True
+                if rect[2] > rect[0]:
+                    ratio = (x - rect[0]) / float(rect[2] - rect[0])
+                    ui.conf = CONF_MIN + ratio * (CONF_MAX - CONF_MIN)
+                    mark_dirty()
+                return
+            rect = ui.rects.get("imgsz_slider")
+            if rect and rect[0] <= x <= rect[2] and rect[1] <= y <= rect[3]:
+                ui.imgsz_drag = True
+                if IMG_SIZES and rect[2] > rect[0]:
+                    ratio = (x - rect[0]) / float(rect[2] - rect[0])
+                    ui.imgsz_idx = int(round(ratio * (len(IMG_SIZES) - 1)))
+                    mark_dirty()
+                return
+            rect = ui.rects.get("blur_slider")
+            if rect and rect[0] <= x <= rect[2] and rect[1] <= y <= rect[3]:
+                ui.blur_drag = True
+                if rect[2] > rect[0]:
+                    ratio = (x - rect[0]) / float(rect[2] - rect[0])
+                    ui.blur = int(round(ratio * MAX_MASK_BLUR))
+                    mark_dirty()
+                return
+            rect = ui.rects.get("morph_slider")
+            if rect and rect[0] <= x <= rect[2] and rect[1] <= y <= rect[3]:
+                ui.morph_drag = True
+                if rect[2] > rect[0]:
+                    ratio = (x - rect[0]) / float(rect[2] - rect[0])
+                    ui.morph = int(round((ratio * 2 - 1) * MAX_MORPH))
+                    mark_dirty()
+                return
+        if event == cv2.EVENT_LBUTTONUP:
+            ui.slider_drag = False
+            ui.skip_drag = False
+            ui.conf_drag = False
+            ui.imgsz_drag = False
+            ui.blur_drag = False
+            ui.morph_drag = False
+        if event == cv2.EVENT_MOUSEMOVE and ui.slider_drag:
+            rect = ui.rects.get("slider")
+            if rect and rect[2] > rect[0]:
+                ratio = (x - rect[0]) / float(rect[2] - rect[0])
+                ratio = min(1.0, max(0.0, ratio))
+                ui.person_limit = int(round(ratio * MAX_PERSON_LIMIT))
+                mark_dirty()
+        if event == cv2.EVENT_MOUSEMOVE and ui.skip_drag:
+            rect = ui.rects.get("skip_slider")
+            if rect and rect[2] > rect[0]:
+                ratio = (x - rect[0]) / float(rect[2] - rect[0])
+                ratio = min(1.0, max(0.0, ratio))
+                ui.skip_frames = int(round(ratio * MAX_SKIP_FRAMES))
+                mark_dirty()
+        if event == cv2.EVENT_MOUSEMOVE and ui.conf_drag:
+            rect = ui.rects.get("conf_slider")
+            if rect and rect[2] > rect[0]:
+                ratio = (x - rect[0]) / float(rect[2] - rect[0])
+                ratio = min(1.0, max(0.0, ratio))
+                ui.conf = CONF_MIN + ratio * (CONF_MAX - CONF_MIN)
+                mark_dirty()
+        if event == cv2.EVENT_MOUSEMOVE and ui.imgsz_drag:
+            rect = ui.rects.get("imgsz_slider")
+            if IMG_SIZES and rect and rect[2] > rect[0]:
+                ratio = (x - rect[0]) / float(rect[2] - rect[0])
+                ratio = min(1.0, max(0.0, ratio))
+                ui.imgsz_idx = int(round(ratio * (len(IMG_SIZES) - 1)))
+                mark_dirty()
+        if event == cv2.EVENT_MOUSEMOVE and ui.blur_drag:
+            rect = ui.rects.get("blur_slider")
+            if rect and rect[2] > rect[0]:
+                ratio = (x - rect[0]) / float(rect[2] - rect[0])
+                ratio = min(1.0, max(0.0, ratio))
+                ui.blur = int(round(ratio * MAX_MASK_BLUR))
+                mark_dirty()
+        if event == cv2.EVENT_MOUSEMOVE and ui.morph_drag:
+            rect = ui.rects.get("morph_slider")
+            if rect and rect[2] > rect[0]:
+                ratio = (x - rect[0]) / float(rect[2] - rect[0])
+                ratio = min(1.0, max(0.0, ratio))
+                ui.morph = int(round((ratio * 2 - 1) * MAX_MORPH))
+                mark_dirty()
+
+    cv2.setMouseCallback(WINDOW_NAME, on_mouse)
+    frame_idx = 0
+    last_boxes: list[Tuple[int, int, int, int]] = []
+    last_persons = 0
+    last_mask = None
+    last_params = (ui.conf, IMG_SIZES[ui.imgsz_idx] if IMG_SIZES else YOLO_IMGSZ)
+    last_saved = 0.0
+    settings_dirty = False
+
+    def mark_dirty() -> None:
+        nonlocal settings_dirty
+        settings_dirty = True
     while True:
-        frame_start = time.perf_counter()
-        if UI_PENDING_MODEL_KEY is not None:
-            model = apply_model_change(model, UI_PENDING_MODEL_KEY, load=not USE_INFERENCE_THREAD)
-            if infer_worker is not None:
-                infer_worker.set_model_path(CURRENT_MODEL_PATH)
-            UI_PENDING_MODEL_KEY = None
-        if UI_PENDING_SOURCE is not None:
-            cap = apply_source_change(UI_PENDING_SOURCE, cap)
-            UI_PENDING_SOURCE = None
-        show_detail = SHOW_DETAIL
+        if cap is not None:
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                frame = _placeholder((CAM_WIDTH, CAM_HEIGHT))
+        else:
+            frame = _placeholder((CAM_WIDTH, CAM_HEIGHT))
 
-        t0 = time.perf_counter()
-        frame, got_new_frame = capture_frame(cap)
-        cap_ms = (time.perf_counter() - t0) * 1000.0
-        if frame is None:
-            if CURRENT_SOURCE == "video" and cap is not None:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                frame, got_new_frame = capture_frame(cap)
-            elif CURRENT_SOURCE == "camera":
-                release_capture(cap)
-                cap = open_capture("camera")
-                frame, got_new_frame = capture_frame(cap)
-                if frame is None:
-                    fallback_h = min(CURRENT_MAX_HEIGHT, IMG_SIZE_OPTIONS[IMG_SIZE_IDX])
-                    fallback_w = int(fallback_h * 16 / 9)
-                    frame = np.zeros((fallback_h, fallback_w, 3), dtype=np.uint8)
-                    got_new_frame = False
-            elif CURRENT_SOURCE in {"ndi", "rtsp"}:
-                # Mantener último frame o negro mientras esperamos señal.
-                if last_frame is not None:
-                    frame = last_frame.copy()
-                else:
-                    fallback_h = min(CURRENT_MAX_HEIGHT, IMG_SIZE_OPTIONS[IMG_SIZE_IDX])
-                    fallback_w = int(fallback_h * 16 / 9)
-                    frame = np.zeros((fallback_h, fallback_w, 3), dtype=np.uint8)
-                got_new_frame = False
-            if frame is None:
-                print("Frame no capturado. Saliendo.", file=sys.stderr)
-                break
-        if CURRENT_SOURCE == "rtsp":
-            if got_new_frame:
-                last_rtsp_frame_time = time.time()
-            elif time.time() - last_rtsp_frame_time > RTSP_RECONNECT_SEC:
-                release_capture(cap)
-                cap = open_capture("rtsp")
-                last_rtsp_frame_time = time.time()
-
-        do_process = (frame_idx % PROCESS_EVERY_N == 0 or last_mask_soft is None) and got_new_frame
-        if do_process:
-            need_person_masks = len(ROI_LIST) > 0 and len(MASK_ROI_LIST) == 0
-            if infer_worker is not None:
-                infer_worker.update_frame(
-                    frame,
-                    {
-                        "people_limit": CURRENT_PEOPLE_LIMIT,
-                        "mask_thresh": MASK_THRESH,
-                        "blur_enabled": BLUR_ENABLED,
-                        "compute_person_masks": need_person_masks,
-                    },
-                )
-            else:
-                mask_soft, mask_detail, boxes, person_masks = segment_people(
-                    frame, model, CURRENT_PEOPLE_LIMIT, MASK_THRESH, BLUR_ENABLED, compute_person_masks=need_person_masks
-                )
-                last_mask_soft, last_mask_detail, last_boxes, last_person_masks = (
-                    mask_soft,
-                    mask_detail,
-                    boxes,
-                    person_masks,
-                )
-                last_frame = frame
-
-        if infer_worker is not None:
-            result, seq = infer_worker.get_latest()
-            if result is not None and seq != last_result_seq:
-                last_result_seq = seq
-                mask_soft, mask_detail, boxes, person_masks = result
-                last_mask_soft, last_mask_detail, last_boxes, last_person_masks = (
-                    mask_soft,
-                    mask_detail,
-                    boxes,
-                    person_masks,
-                )
-                last_frame = frame
-            else:
-                mask_soft, mask_detail, boxes, person_masks = (
-                    last_mask_soft,
-                    last_mask_detail,
-                    last_boxes,
-                    last_person_masks,
-                )
-        elif not do_process:
-            mask_soft, mask_detail, boxes, person_masks = (
-                last_mask_soft,
-                last_mask_detail,
-                last_boxes,
-                last_person_masks,
-            )
+        persons = 0
+        if worker is not None:
+            imgsz_val = IMG_SIZES[ui.imgsz_idx] if IMG_SIZES else YOLO_IMGSZ
+            params = (ui.conf, imgsz_val)
+            if params != last_params:
+                worker.update_params(ui.conf, imgsz_val)
+                last_params = params
+            skip_frames = ui.skip_frames if MAX_SKIP_FRAMES > 0 else YOLO_SKIP_FRAMES
+            run_infer = skip_frames == 0 or (frame_idx % (skip_frames + 1) == 0)
+            if run_infer:
+                worker.submit(frame.copy())
+            result = worker.get_latest()
+            last_boxes = result.boxes
+            last_persons = result.persons
+            last_mask = result.combined_mask
+            persons = last_persons
+            for i, (x1, y1, x2, y2) in enumerate(last_boxes, start=1):
+                if ui.person_limit > 0 and i > ui.person_limit:
+                    continue
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
+        ui.persons_detected = persons
         frame_idx += 1
 
-        # Fallback en caso de no tener máscaras aún (evita crash en cvtColor).
-        if mask_soft is None or mask_detail is None:
-            h, w = frame.shape[:2]
-            fallback_mask = np.zeros((h, w), dtype=np.uint8)
-            if mask_soft is None:
-                mask_soft = fallback_mask
-            if mask_detail is None:
-                mask_detail = fallback_mask
-
-        if do_process or last_boxed is None:
-            boxed = draw_boxes(frame, boxes)
-            last_boxed = boxed
-        else:
-            boxed = last_boxed
-
-        # FPS + persistencia.
         now = time.time()
         dt = now - prev_time
+        if dt > 0:
+            fps = 1.0 / dt
         prev_time = now
-        fps = 1.0 / dt if dt > 0 else 0.0
-        persist_mask, last_detect_time, last_detect_mask = update_persistent_mask(
-            persist_mask, mask_detail, last_detect_time, last_detect_mask, now, max(dt, 1e-6)
-        )
-        persist_u8 = np.clip(persist_mask * 255.0, 0, 255).astype(np.uint8)
-        if frame_idx % 10 == 0:
-            print(f"FPS: {fps:0.2f}", end="\r", flush=True)
-        if frame_idx % 30 == 0:
-            frame_ms = (time.perf_counter() - frame_start) * 1000.0
-            print(
-                f"FRAME_MS: {frame_ms:0.2f} | CAP_MS: {cap_ms:0.2f} | WAIT_MS: {wait_ms:0.2f}",
-                end="\r",
-                flush=True,
-            )
 
-        # Composición en ventana única: tres vistas (izquierda + panel tabbed + derecha).
-        canvas = np.full((canvas_size[1], canvas_size[0], 3), UI_BG_COLOR, dtype=np.uint8)
-        view_h = canvas_size[1] - header_h - footer_h - FOOTER_GAP_PX - VIEW_OFFSET_Y
-        third_w = canvas_size[0] // 3
-        right_view_h = canvas_size[1] - header_h - VIEW_OFFSET_Y - RIGHT_PANEL_FOOTER_H
-        view_y = header_h + VIEW_OFFSET_Y
-        VIEW_HITBOXES = []
-
-        left_key = (id(boxed), third_w, view_h)
-        if cached_left_view is None or cached_left_key != left_key:
-            left_view = fit_to_box(boxed, (third_w, view_h))
-            cached_left_view = left_view
-            cached_left_key = left_key
-        else:
-            left_view = cached_left_view
-        if do_process or last_mask_to_show is None:
-            mask_to_show = mask_detail if show_detail else mask_soft
-            last_mask_to_show = mask_to_show
-        else:
-            mask_to_show = last_mask_to_show
-        if ACTIVE_VIEW_TAB == "mask":
-            middle_key = (show_detail, id(mask_soft), id(mask_detail), ACTIVE_VIEW_TAB)
-            if cached_middle_view is None or cached_middle_key != middle_key:
-                middle_image = cv2.cvtColor(mask_to_show, cv2.COLOR_GRAY2BGR)
-                cached_middle_view = make_tabbed_view(
-                    middle_image,
-                    (third_w, view_h),
-                    (("mask", "Mask"), ("mod", "Suavizado")),
-                    ACTIVE_VIEW_TAB,
-                )
-                cached_middle_key = middle_key
-            middle_view, tab_rects = cached_middle_view
-        else:
-            middle_image = cv2.cvtColor(persist_u8, cv2.COLOR_GRAY2BGR)
-            middle_view, tab_rects = make_tabbed_view(
-                middle_image,
-                (third_w, view_h),
-                (("mask", "Mask"), ("mod", "Suavizado")),
-                ACTIVE_VIEW_TAB,
-            )
-        mask_label_h = min(VIEW_LABEL_H, max(16, view_h // 6))
-        mask_panel_w = third_w
-        mask_panel_h = max(1, view_h - mask_label_h)
-        MASK_ROI_PANEL_BOUNDS = (mask_panel_w, mask_panel_h)
-        MASK_ROI_PANEL_BOUNDS_ABS = (third_w, view_y + mask_label_h, mask_panel_w, mask_panel_h)
-        src_h, src_w = mask_to_show.shape[:2]
-        mask_scale = min(mask_panel_w / float(src_w), mask_panel_h / float(src_h))
-        new_w = max(1, int(src_w * mask_scale))
-        new_h = max(1, int(src_h * mask_scale))
-        x_off = 0 if new_w >= mask_panel_w else (mask_panel_w - new_w) // 2
-        y_off = 0
-        MASK_PANEL_FIT = (mask_scale, x_off, y_off, new_w, new_h, src_w, src_h)
-        if MASK_ROI_LIST:
-            middle_view = middle_view.copy()
-            for roi in MASK_ROI_LIST:
-                _clamp_roi(roi, mask_panel_w, mask_panel_h)
-                x1, y1, x2, y2 = _roi_rect(roi)
-                x1 = max(0, min(mask_panel_w - 1, x1))
-                y1 = max(0, min(mask_panel_h - 1, y1))
-                x2 = max(0, min(mask_panel_w - 1, x2))
-                y2 = max(0, min(mask_panel_h - 1, y2))
-                if x2 > x1 and y2 > y1:
-                    cv2.rectangle(
-                        middle_view,
-                        (x1, mask_label_h + y1),
-                        (x2, mask_label_h + y2),
-                        (0, 200, 120),
-                        2,
+        third_w = CANVAS_WIDTH // 3
+        cam_view = _fit_to_width(frame, third_w)
+        cam_h = cam_view.shape[0]
+        mask_top = cam_h
+        mask_h = cam_h
+        total_h = cam_h + mask_h
+        canvas = np.zeros((total_h, CANVAS_WIDTH, 3), dtype=np.uint8)
+        canvas[:cam_h, :third_w] = cam_view
+        if mask_h > 0:
+            if last_mask is not None:
+                mask = last_mask
+                if mask.shape[:2] != frame.shape[:2]:
+                    mask = cv2.resize(
+                        mask,
+                        (frame.shape[1], frame.shape[0]),
+                        interpolation=cv2.INTER_NEAREST,
                     )
-        mask_roi_masks = None
-        if MASK_ROI_LIST:
-            if cached_mask_roi_masks is None or MASK_ROI_DIRTY or do_process:
-                mask_roi_masks = mask_rois_to_masks(mask_to_show)
-                cached_mask_roi_masks = mask_roi_masks
-                MASK_ROI_DIRTY = False
+                if ui.blur > 1:
+                    k = ui.blur if ui.blur % 2 == 1 else ui.blur + 1
+                    mask = cv2.GaussianBlur(mask, (k, k), 0)
+                else:
+                    mask = _smooth_mask(mask)
+                mask = _apply_morph(mask, ui.morph)
+                mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
             else:
-                mask_roi_masks = cached_mask_roi_masks
-        else:
-            cached_mask_roi_masks = None
-        roi_avail_w = third_w
-        roi_avail_h = max(1, right_view_h - VIEW_LABEL_H)
-        roi_scale = min(
-            roi_avail_w / float(NDI_TR_OUTPUT_W),
-            roi_avail_h / float(NDI_TR_OUTPUT_H),
-        )
-        roi_w = max(1, int(NDI_TR_OUTPUT_W * roi_scale))
-        roi_h = max(1, int(NDI_TR_OUTPUT_H * roi_scale))
-        roi_x_off = max(0, (third_w - roi_w) // 2)
-        roi_y_off = VIEW_LABEL_H  # align to top under label, like other views
-        source_masks = mask_roi_masks if MASK_ROI_LIST else person_masks
-        if cached_translated is None or ROI_DIRTY or MASK_ROI_DIRTY or do_process:
-            translated = translate_masks_to_rois(
-                source_masks, ROI_LIST, (roi_w, roi_h), now, max(dt, 1e-6)
+                mask_bgr = _mask_placeholder((third_w, mask_h))
+            mask_view = cv2.resize(mask_bgr, (third_w, mask_h), interpolation=cv2.INTER_NEAREST)
+            canvas[mask_top : mask_top + mask_h, :third_w] = mask_view
+            cv2.rectangle(
+                canvas,
+                (0, mask_top),
+                (third_w - 1, mask_top + mask_h - 1),
+                (90, 90, 90),
+                1,
             )
-            cached_translated = translated
-            ROI_DIRTY = False
-            MASK_ROI_DIRTY = False
-        else:
-            translated = cached_translated
-        right_key = (id(translated), roi_w, roi_h)
-        if cached_right_bgr is None or cached_right_key != right_key:
-            right_image = cv2.cvtColor(translated, cv2.COLOR_GRAY2BGR)
-            cached_right_bgr = right_image
-            cached_right_key = right_key
-        else:
-            right_image = cached_right_bgr
-
-        left_labeled_key = (id(left_view), third_w, view_h)
-        if cached_left_labeled is None or cached_left_labeled_key != left_labeled_key:
-            left_view = make_labeled_view(left_view, "Original + Boxes", (third_w, view_h))
-            cached_left_labeled = left_view
-            cached_left_labeled_key = left_labeled_key
-        else:
-            left_view = cached_left_labeled
-        right_view = np.full((right_view_h, third_w, 3), RIGHT_PANEL_BG_COLOR, dtype=np.uint8)
-        cv2.rectangle(right_view, (0, 0), (third_w - 1, VIEW_LABEL_H), UI_BG_COLOR, -1)
+        res_label = RES_OPTIONS[ui.selected_res][0] if RES_OPTIONS else "N/A"
         cv2.putText(
-            right_view,
-            "Traslaciones",
-            (UI_MARGIN_LEFT, VIEW_LABEL_H - 6),
+            canvas,
+            f"CAM {cam_index} {res_label} | FPS {fps:05.1f}",
+            (20, 30),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,
-            (235, 235, 235),
-            1,
+            (255, 255, 255),
+            2,
         )
-        roi_view = np.full((roi_h, roi_w, 3), ROI_WORK_BG_COLOR, dtype=np.uint8)
-        if translated is not None:
-            mask = translated > 0
-            roi_view[mask] = right_image[mask]
-        right_view[roi_y_off : roi_y_off + roi_h, roi_x_off : roi_x_off + roi_w] = roi_view
+        _draw_ui(canvas, ui, third_w + UI_LEFT_MARGIN)
+        cv2.imshow(WINDOW_NAME, canvas)
 
-        ROI_PANEL_BOUNDS = (roi_w, roi_h)
-        ROI_PANEL_BOUNDS_ABS = (
-            2 * third_w + roi_x_off,
-            view_y + roi_y_off,
-            roi_w,
-            roi_h,
-        )
-        rx0, ry0, rw, rh = ROI_PANEL_BOUNDS_ABS
-        if ROI_LIST:
-            for roi in ROI_LIST:
-                _clamp_roi(roi, rw, rh)
-                x1, y1, x2, y2 = _roi_rect(roi)
-                x1 = max(0, min(rw - 1, x1))
-                y1 = max(0, min(rh - 1, y1))
-                x2 = max(0, min(rw - 1, x2))
-                y2 = max(0, min(rh - 1, y2))
-                if x2 > x1 and y2 > y1:
-                    cv2.rectangle(
-                        right_view,
-                        (roi_x_off + x1, roi_y_off + y1),
-                        (roi_x_off + x2, roi_y_off + y2),
-                        (255, 0, 0),
-                        2,
-                    )
+        now_time = time.time()
+        if settings_dirty and (now_time - last_saved) >= SETTINGS_SAVE_INTERVAL:
+            data = {
+                "cam_index": cam_index,
+                "selected_res": ui.selected_res,
+                "selected_model": ui.selected_model,
+                "person_limit": ui.person_limit,
+                "skip_frames": ui.skip_frames,
+                "conf": ui.conf,
+                "imgsz_idx": ui.imgsz_idx,
+                "blur": ui.blur,
+                "morph": ui.morph,
+            }
+            _save_settings(SETTINGS_PATH, data)
+            last_saved = now_time
+            settings_dirty = False
 
-        canvas[view_y : view_y + left_view.shape[0], 0:third_w] = left_view
-        canvas[
-            view_y : view_y + middle_view.shape[0], third_w : third_w + middle_view.shape[1]
-        ] = middle_view
-        canvas[
-            view_y : view_y + right_view.shape[0], 2 * third_w : 2 * third_w + right_view.shape[1]
-        ] = right_view
-
-        for key, rect in tab_rects:
-            abs_rect = (
-                third_w + rect[0],
-                view_y + rect[1],
-                third_w + rect[2],
-                view_y + rect[3],
-            )
-            VIEW_HITBOXES.append({"type": "view_tab", "rect": abs_rect, "value": key, "enabled": True})
-
-        border_color = (200, 200, 200)
-        border_top = view_y + VIEW_LABEL_H
-        border_bottom = view_y + view_h - 1
-        cv2.rectangle(canvas, (0, border_top), (third_w - 1, border_bottom), border_color, 1)
-        cv2.rectangle(canvas, (third_w, border_top), (2 * third_w - 1, border_bottom), border_color, 1)
-        right_border_bottom = view_y + right_view_h - 1
-        cv2.rectangle(canvas, (2 * third_w, border_top), (3 * third_w - 1, right_border_bottom), border_color, 1)
-
-        # Right panel controls (ROI +/-, reset, NDI TR) under the third window.
-        right_x0 = 2 * third_w
-        btn_h = 24
-        gap = 8
-        x = right_x0 + RIGHT_PANEL_MARGIN_X
-        y = view_y + right_view_h + RIGHT_PANEL_ROW_GAP
-        max_x = right_x0 + third_w - RIGHT_PANEL_MARGIN_X
-
-        def _place_right_button(label: str, width: int, active: bool, enabled: bool, item_id: str) -> None:
-            nonlocal x, y
-            if x + width > max_x:
-                y += btn_h + RIGHT_PANEL_ROW_GAP
-                x = right_x0 + RIGHT_PANEL_MARGIN_X
-            rect = (x, y, x + width, y + btn_h)
-            _draw_button(canvas, rect, label, active, enabled)
-            VIEW_HITBOXES.append({"type": "button" if item_id.startswith("roi") else "toggle", "id": item_id, "rect": rect, "enabled": enabled})
-            x += width + gap
-
-        _place_right_button("ROI +", 90, False, len(ROI_LIST) < ROI_MAX, "roi_add")
-        _place_right_button("ROI -", 70, False, len(ROI_LIST) > 0, "roi_remove")
-        _place_right_button("ROI reset", 90, False, len(ROI_LIST) > 0, "roi_reset")
-        _place_right_button("NDI TR", 120, ENABLE_NDI_TRANSLATIONS_OUTPUT, ENABLE_NDI, "ndi_trans_output")
-
-        btn_h = 24
-        pad = 8
-        btn_w = 90
-        btn_y = view_y + view_h + 10
-
-        left_btn = (pad, btn_y, pad + btn_w, btn_y + btn_h)
-        _draw_button(canvas, left_btn, "NDI IN", ENABLE_NDI_INPUT, ENABLE_NDI)
-        VIEW_HITBOXES.append({"type": "toggle", "id": "ndi_input", "rect": left_btn, "enabled": ENABLE_NDI})
-        rtsp_btn = (pad + btn_w + 8, btn_y, pad + btn_w + 8 + btn_w, btn_y + btn_h)
-        _draw_button(canvas, rtsp_btn, "RTSP IN", ENABLE_RTSP_INPUT, True)
-        VIEW_HITBOXES.append({"type": "toggle", "id": "rtsp_input", "rect": rtsp_btn, "enabled": True})
-        rtsp_cfg_btn = (pad + (btn_w + 8) * 2, btn_y, pad + (btn_w + 8) * 2 + btn_w, btn_y + btn_h)
-        _draw_button(canvas, rtsp_cfg_btn, "RTSP CFG", False, True)
-        VIEW_HITBOXES.append({"type": "button", "id": "rtsp_cfg", "rect": rtsp_cfg_btn, "enabled": True})
-
-        mid_x0 = third_w
-        mid_btn = (mid_x0 + pad, btn_y, mid_x0 + pad + 100, btn_y + btn_h)
-        _draw_button(canvas, mid_btn, "NDI OUT", ENABLE_NDI_OUTPUT, ENABLE_NDI)
-        VIEW_HITBOXES.append({"type": "toggle", "id": "ndi_output", "rect": mid_btn, "enabled": ENABLE_NDI})
-        mbtn_x = mid_btn[2] + 8
-        mbtn_y = btn_y
-        roi_add_btn = (mbtn_x, mbtn_y, mbtn_x + 70, mbtn_y + btn_h)
-        _draw_button(canvas, roi_add_btn, "ROI +", False, len(MASK_ROI_LIST) < ROI_MAX)
-        VIEW_HITBOXES.append(
-            {"type": "button", "id": "mask_roi_add", "rect": roi_add_btn, "enabled": len(MASK_ROI_LIST) < ROI_MAX}
-        )
-        mbtn_x = roi_add_btn[2] + 6
-        roi_rm_btn = (mbtn_x, mbtn_y, mbtn_x + 60, mbtn_y + btn_h)
-        _draw_button(canvas, roi_rm_btn, "ROI -", False, len(MASK_ROI_LIST) > 0)
-        VIEW_HITBOXES.append(
-            {"type": "button", "id": "mask_roi_remove", "rect": roi_rm_btn, "enabled": len(MASK_ROI_LIST) > 0}
-        )
-        mbtn_x = roi_rm_btn[2] + 6
-        roi_reset_btn = (mbtn_x, mbtn_y, mbtn_x + 90, mbtn_y + btn_h)
-        _draw_button(canvas, roi_reset_btn, "ROI reset", False, len(MASK_ROI_LIST) > 0)
-        VIEW_HITBOXES.append(
-            {"type": "button", "id": "mask_roi_reset", "rect": roi_reset_btn, "enabled": len(MASK_ROI_LIST) > 0}
-        )
-
-
-        res_text = f"{frame.shape[1]}x{frame.shape[0]}"
-        people_count = len(boxes) if boxes is not None else 0
-        cap_fps = None
-        if hasattr(cap, "get"):
-            try:
-                cap_fps = cap.get(cv2.CAP_PROP_FPS)
-            except Exception:
-                cap_fps = None
-        add_header(canvas, fps, DEVICE, res_text, people_count, source_label(), cap_fps=cap_fps)
-
-        osc_now = time.time()
-        if osc_now - last_osc_time >= OSC_SEND_INTERVAL:
-            if (OSC_IP, OSC_PORT) != last_osc_target:
-                osc_sender.update_target(OSC_IP, OSC_PORT)
-                last_osc_target = (OSC_IP, OSC_PORT)
-            if osc_sender.enabled != OSC_ENABLED:
-                osc_sender.enabled = OSC_ENABLED
-            if not OSC_ENABLED:
-                last_osc_time = osc_now
-                continue
-            mask_payload = []
-            if roi_w > 0 and roi_h > 0 and ROI_LIST:
-                scale_x = NDI_TR_OUTPUT_W / float(roi_w)
-                scale_y = NDI_TR_OUTPUT_H / float(roi_h)
-                for idx, roi in enumerate(ROI_LIST):
-                    x_pos = int(roi["cx"] * scale_x)
-                    y_pos = int(roi["cy"] * scale_y)
-                    mask_payload.append((idx + 1, x_pos, y_pos))
-            if (
-                people_count != last_osc_people
-                or mask_payload != last_osc_masks
-                or (osc_now - last_osc_time) >= 1.0
-            ):
-                osc_sender.send("/personas", people_count)
-                for idx, x_pos, y_pos in mask_payload:
-                    osc_sender.send("/mask", idx, x_pos, y_pos)
-                last_osc_people = people_count
-                last_osc_masks = mask_payload
-                last_osc_time = osc_now
-
-        footer_top = canvas.shape[0] - footer_h
-        left_footer_w = third_w * 2
-        footer_key = (
-            left_footer_w,
-            footer_h,
-            CURRENT_MAX_HEIGHT,
-            CURRENT_PEOPLE_LIMIT,
-            BLUR_KERNEL_IDX,
-            BLUR_ENABLED,
-            MASK_THRESH,
-            IMG_SIZE_IDX,
-            HIGH_PRECISION_MODE,
-            SHOW_DETAIL,
-            FLIP_INPUT,
-            CURRENT_MODEL_KEY,
-            CURRENT_SOURCE,
-            bool(VIDEO_FILES),
-            ENABLE_NDI,
-            ENABLE_NDI_INPUT,
-            ENABLE_NDI_OUTPUT,
-            ENABLE_NDI_TRANSLATIONS_OUTPUT,
-            len(ROI_LIST),
-            round(PERSIST_HOLD_SEC, 3),
-            round(PERSIST_RISE_TAU, 3),
-            round(PERSIST_FALL_TAU, 3),
-            CAMERA_INDEX,
-            PROCESS_EVERY_N,
-            CAMERA_FPS,
-            CAMERA_FOURCC,
-            CAMERA_REQ_HEIGHT,
-            CAMERA_MATCH_MAXH,
-            USE_CAMERA_THREAD,
-            USE_RTSP_THREAD,
-            OSC_IP,
-            OSC_PORT,
-            OSC_ENABLED,
-            UI_ACTIVE_TEXT,
-            UI_TEXT_BUFFER,
-        )
-        if FOOTER_CACHE is None or FOOTER_CACHE_KEY != footer_key:
-            footer_layer = np.full((footer_h, left_footer_w, 3), UI_BG_COLOR, dtype=np.uint8)
-            add_footer(footer_layer, CURRENT_MAX_HEIGHT, footer_h=footer_h, footer_top=0)
-            FOOTER_CACHE = footer_layer
-            FOOTER_CACHE_KEY = footer_key
-            FOOTER_CACHE_HITBOXES = [item.copy() for item in UI_HITBOXES]
-        else:
-            UI_HITBOXES = [item.copy() for item in FOOTER_CACHE_HITBOXES]
-
-        if FOOTER_CACHE is not None:
-            canvas[-footer_h:, :left_footer_w] = FOOTER_CACHE
-        # Offset cached hitboxes to absolute canvas coordinates.
-        for item in UI_HITBOXES:
-            x1, y1, x2, y2 = item["rect"]
-            item["rect"] = (x1, y1 + footer_top, x2, y2 + footer_top)
-
-        # Publicación NDI (máscara) - por defecto la suave; cambiar a mask_detail si se desea.
-        if ENABLE_NDI and ENABLE_NDI_OUTPUT and ndi_pub is None:
-            ndi_pub = NDIPublisher("NEXT2 Mask NDI")
-        if not ENABLE_NDI_OUTPUT:
-            ndi_pub = None
-        if ndi_pub is not None:
-            mask_out = mask_soft if NDI_OUTPUT_MASK == "soft" else mask_detail
-            ndi_pub.publish(mask_out)
-        if ENABLE_NDI and ENABLE_NDI_TRANSLATIONS_OUTPUT and ndi_trans_pub is None:
-            ndi_trans_pub = NDIPublisher("NEXT2 Translations NDI")
-        if not ENABLE_NDI_TRANSLATIONS_OUTPUT:
-            ndi_trans_pub = None
-        if ndi_trans_pub is not None:
-            trans_out = translated
-            if trans_out.shape[:2] != (NDI_TR_OUTPUT_H, NDI_TR_OUTPUT_W):
-                trans_out = cv2.resize(
-                    trans_out,
-                    (NDI_TR_OUTPUT_W, NDI_TR_OUTPUT_H),
-                    interpolation=cv2.INTER_NEAREST,
-                )
-            ndi_trans_pub.publish(trans_out)
-
-        cv2.imshow(window_name, canvas)
-
-        key = 0
-        wait_ms = 0.0
-        if frame_idx % 2 == 0:
-            t_wait = time.perf_counter()
-            if hasattr(cv2, "pollKey"):
-                key = cv2.pollKey() & 0xFF
-            else:
-                key = cv2.waitKey(1) & 0xFF
-            wait_ms = (time.perf_counter() - t_wait) * 1000.0
-        if key != 0 and UI_ACTIVE_TEXT is not None:
-            if _handle_text_input(key):
-                continue
+        key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
             break
-        # Resolución por teclas 1-5
-        if key in (ord("1"), ord("2"), ord("3"), ord("4"), ord("5")):
-            set_resolution_by_index(int(chr(key)) - 1)
-            save_settings()
-        # Cambio de modelo por teclas configuradas
-        if key in MODEL_OPTIONS:
-            model = apply_model_change(model, key)
-        # Ajuste de límite de personas con +/- (teclado principal)
-        if key == ord("+") or key == ord("="):
-            CURRENT_PEOPLE_LIMIT = min(CURRENT_PEOPLE_LIMIT + 1, PEOPLE_LIMIT_OPTIONS[-1])
-            save_settings()
-        if key == ord("-"):
-            CURRENT_PEOPLE_LIMIT = max(CURRENT_PEOPLE_LIMIT - 1, PEOPLE_LIMIT_OPTIONS[0])
-            save_settings()
-        # Ajuste de blur (detallado de silueta)
-        if key == ord("o"):
-            BLUR_KERNEL_IDX = max(0, BLUR_KERNEL_IDX - 1)
-            save_settings()
-        if key == ord("p"):
-            BLUR_KERNEL_IDX = min(len(BLUR_KERNEL_OPTIONS) - 1, BLUR_KERNEL_IDX + 1)
-            save_settings()
-        if key == ord("b"):
-            BLUR_ENABLED = not BLUR_ENABLED
-            save_settings()
-        # Ajuste de threshold de binarización
-        if key == ord("j"):
-            MASK_THRESH = max(0, MASK_THRESH - 5)
-            save_settings()
-        if key == ord("k"):
-            MASK_THRESH = min(255, MASK_THRESH + 5)
-            save_settings()
-        # Ajuste de imgsz (resolución de inferencia)
-        if key == ord(","):
-            IMG_SIZE_IDX = max(0, IMG_SIZE_IDX - 1)
-            save_settings()
-        if key == ord("."):
-            IMG_SIZE_IDX = min(len(IMG_SIZE_OPTIONS) - 1, IMG_SIZE_IDX + 1)
-            save_settings()
-        # Cambio de fuente
         if key == ord("c"):
-            if CURRENT_SOURCE == "camera":
-                next_idx = None
-                for step in range(1, CAMERA_MAX_INDEX + 2):
-                    cand = (CAMERA_INDEX + step) % (CAMERA_MAX_INDEX + 1)
-                    if _probe_camera_index(cand):
-                        next_idx = cand
-                        break
-                if next_idx is not None:
-                    CAMERA_INDEX = next_idx
-                    CAMERA_INDEX_CHANGED = True
-                    save_settings()
-            cap = apply_source_change("camera", cap)
-        if key == ord("v"):
-            if CURRENT_SOURCE == "camera":
-                next_idx = None
-                for step in range(1, CAMERA_MAX_INDEX + 2):
-                    cand = (CAMERA_INDEX + step) % (CAMERA_MAX_INDEX + 1)
-                    if _probe_camera_index(cand):
-                        next_idx = cand
-                        break
-                if next_idx is not None:
-                    CAMERA_INDEX = next_idx
-                    CAMERA_INDEX_CHANGED = True
-                    save_settings()
-            cap = apply_source_change("camera", cap)
-        if key == ord("n") and ENABLE_NDI and ENABLE_NDI_INPUT:
-            cap = apply_source_change("ndi", cap)
-        if key == ord("r"):
-            cap = apply_source_change("rtsp", cap)
-        # Modo alta precisión (usa imgsz máximo y detalle sin blur)
-        if key == ord("h"):
-            HIGH_PRECISION_MODE = not HIGH_PRECISION_MODE
-            save_settings()
-        # Toggle de máscara mostrada (soft/detail)
-        if key == ord("m"):
-            show_detail = not show_detail
-            SHOW_DETAIL = show_detail
-            save_settings()
-        # Flip horizontal de la entrada
-        if key == ord("f"):
-            FLIP_INPUT = not FLIP_INPUT
-            save_settings()
+            if cap is not None:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+            cap, cam_index = _cycle_camera(cam_index + 1)
+            if cap is None:
+                print("[CAM] No cameras available.", file=sys.stderr)
+            mark_dirty()
 
-    if infer_worker is not None:
-        infer_worker.stop()
-    cap.release()
+        # light sleep to avoid busy loop if camera is missing
+        if cap is None and (time.time() - last_frame_time) < 0.05:
+            time.sleep(0.01)
+        last_frame_time = time.time()
+
+    if cap is not None:
+        try:
+            cap.release()
+        except Exception:
+            pass
+    if worker is not None:
+        worker.stop()
     cv2.destroyAllWindows()
+    if settings_dirty:
+        data = {
+            "cam_index": cam_index,
+            "selected_res": ui.selected_res,
+            "selected_model": ui.selected_model,
+            "person_limit": ui.person_limit,
+            "skip_frames": ui.skip_frames,
+            "conf": ui.conf,
+            "imgsz_idx": ui.imgsz_idx,
+            "blur": ui.blur,
+            "morph": ui.morph,
+        }
+        _save_settings(SETTINGS_PATH, data)
     return 0
 
 
