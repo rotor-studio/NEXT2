@@ -37,7 +37,7 @@ MASK_BLUR = max(0, int(os.environ.get("NEXT_MASK_BLUR", "5")))
 MAX_MASK_BLUR = max(1, int(os.environ.get("NEXT_MASK_BLUR_MAX", "15")))
 CONF_MIN = float(os.environ.get("NEXT_CONF_MIN", "0.1"))
 CONF_MAX = float(os.environ.get("NEXT_CONF_MAX", "0.6"))
-IMG_SIZES = [256, 320, 384, 448, 512, 640, 768]
+IMG_SIZES = [256, 320, 384, 448, 512, 640, 768, 1024]
 MAX_MORPH = max(0, int(os.environ.get("NEXT_MASK_MORPH_MAX", "5")))
 PERSIST_HOLD_MAX = float(os.environ.get("NEXT_PERSIST_HOLD_MAX", "2.0"))
 PERSIST_RISE_MAX = float(os.environ.get("NEXT_PERSIST_RISE_MAX", "1.0"))
@@ -79,6 +79,18 @@ UI_LABEL_GAP = 20
 UI_LEFT_MARGIN = 14
 UI_TOP_MARGIN = 14
 UI_PANEL_W = max(UI_BTN_W * 3 + UI_BTN_GAP * 2, UI_BTN_W * 2 + UI_BTN_GAP)
+SHOW_MASK_COLORS = False
+SHOW_GALLERY_COLORS = False
+COLOR_PALETTE = [
+    (255, 80, 80),
+    (80, 255, 80),
+    (80, 80, 255),
+    (255, 200, 80),
+    (200, 80, 255),
+    (80, 255, 200),
+    (255, 120, 200),
+    (160, 255, 80),
+]
 
 
 def _open_camera(idx: int) -> Optional[cv2.VideoCapture]:
@@ -345,6 +357,7 @@ class InferenceResult:
     person_masks: list[np.ndarray] = field(default_factory=list)
     person_scales: list[float] = field(default_factory=list)
     person_centroids: list[Tuple[float, float]] = field(default_factory=list)
+    person_boxes: list[Tuple[int, int, int, int]] = field(default_factory=list)
     persons: int = 0
 
 
@@ -429,6 +442,7 @@ class YoloWorker:
                 person_masks: list[np.ndarray] = []
                 person_scales: list[float] = []
                 person_centroids: list[Tuple[float, float]] = []
+                person_boxes: list[Tuple[int, int, int, int]] = []
                 persons = 0
                 combined_mask = None
                 mask_canvas = None
@@ -480,6 +494,7 @@ class YoloWorker:
                         boxes_out.append((bx1, by1, bx2, by2))
                         person_scales.append(min(1.0, max(0.0, size_ratio)))
                         person_centroids.append(((bx1 + bx2) / 2.0, (by1 + by2) / 2.0))
+                        person_boxes.append((bx1, by1, bx2, by2))
                         person_masks.append(local_mask)
                         if mask_canvas is not None and pts is not None:
                             cv2.fillPoly(mask_canvas, [pts], 255)
@@ -492,6 +507,7 @@ class YoloWorker:
                         person_masks=person_masks,
                         person_scales=person_scales,
                         person_centroids=person_centroids,
+                        person_boxes=person_boxes,
                         persons=persons,
                     )
             except Exception as exc:
@@ -1028,6 +1044,7 @@ def _draw_ui(canvas: np.ndarray, ui: UIState, start_x: int) -> None:
 
 
 def main() -> int:
+    global SHOW_MASK_COLORS, SHOW_GALLERY_COLORS
     cv2.setUseOptimized(True)
     try:
         cv2.setNumThreads(max(1, int(os.environ.get("NEXT_CV_THREADS", "2"))))
@@ -1415,6 +1432,9 @@ def main() -> int:
     last_boxes: list[Tuple[int, int, int, int]] = []
     last_persons = 0
     last_mask = None
+    last_person_masks: list[np.ndarray] = []
+    last_slot_masks: list[Optional[np.ndarray]] = [None for _ in range(MAX_PERSON_LIMIT)]
+    last_slot_boxes: list[Optional[Tuple[int, int, int, int]]] = [None for _ in range(MAX_PERSON_LIMIT)]
     last_params = (
         ui.conf,
         IMG_SIZES[ui.imgsz_idx] if IMG_SIZES else YOLO_IMGSZ,
@@ -1472,6 +1492,7 @@ def main() -> int:
             last_boxes = result.boxes
             last_persons = result.persons
             last_mask = result.combined_mask
+            last_person_masks = result.person_masks
             if ui.person_limit == 0:
                 for idx in range(MAX_PERSON_LIMIT):
                     gallery_slots[idx] = None
@@ -1480,12 +1501,15 @@ def main() -> int:
                     gallery_last_time[idx] = None
                     gallery_last_mask[idx] = None
                     gallery_centroids[idx] = None
+                    last_slot_masks[idx] = None
+                    last_slot_boxes[idx] = None
             if result.person_masks:
                 dets = list(
                     zip(
                         result.person_masks,
                         result.person_scales,
                         result.person_centroids,
+                        result.person_boxes,
                     )
                 )
             else:
@@ -1493,22 +1517,40 @@ def main() -> int:
 
             assigned = set()
             slot_used = [False] * MAX_PERSON_LIMIT
+
+            def _iou(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> float:
+                ax1, ay1, ax2, ay2 = a
+                bx1, by1, bx2, by2 = b
+                ix1 = max(ax1, bx1)
+                iy1 = max(ay1, by1)
+                ix2 = min(ax2, bx2)
+                iy2 = min(ay2, by2)
+                iw = max(0, ix2 - ix1)
+                ih = max(0, iy2 - iy1)
+                inter = iw * ih
+                if inter <= 0:
+                    return 0.0
+                area_a = max(1, (ax2 - ax1) * (ay2 - ay1))
+                area_b = max(1, (bx2 - bx1) * (by2 - by1))
+                return inter / float(area_a + area_b - inter)
+
             for i, det in enumerate(dets):
-                mask, scale, cent = det
+                mask, scale, cent, box = det
                 best_slot = None
                 best_dist = None
+                best_iou = 0.0
                 for s in range(MAX_PERSON_LIMIT):
                     if slot_used[s]:
                         continue
-                    if gallery_centroids[s] is None:
+                    last_box = last_slot_boxes[s]
+                    if last_box is None:
                         continue
-                    sx, sy = gallery_centroids[s]
-                    dx = cent[0] - sx
-                    dy = cent[1] - sy
-                    dist = dx * dx + dy * dy
-                    if best_dist is None or dist < best_dist:
-                        best_dist = dist
+                    score = _iou(last_box, box)
+                    if score > best_iou:
+                        best_iou = score
                         best_slot = s
+                if best_iou < 0.2:
+                    best_slot = None
                 if best_slot is None:
                     for s in range(MAX_PERSON_LIMIT):
                         if slot_used[s]:
@@ -1534,7 +1576,8 @@ def main() -> int:
                         det = dets[i]
                         break
                 if det is not None:
-                    new_mask, raw, cent = det
+                    new_mask, raw, cent, box = det
+                    last_slot_boxes[s] = box
                     persist, last_t, last_m = _update_persistent_mask(
                         gallery_persist[s],
                         new_mask,
@@ -1551,6 +1594,7 @@ def main() -> int:
                     gallery_last_mask[s] = last_m
                     gallery_slots[s] = np.clip(persist * 255.0, 0, 255).astype(np.uint8)
                     gallery_centroids[s] = cent
+                    last_slot_masks[s] = new_mask
                     if gallery_scales[s] <= 0.0 or raw >= gallery_scales[s]:
                         gallery_scales[s] = raw
                     else:
@@ -1578,11 +1622,33 @@ def main() -> int:
                         gallery_slots[s] = None
                         gallery_scales[s] = 0.0
                         gallery_centroids[s] = None
+                        last_slot_masks[s] = None
+                        last_slot_boxes[s] = None
             persons = last_persons
             for i, (x1, y1, x2, y2) in enumerate(last_boxes, start=1):
                 if ui.person_limit > 0 and i > ui.person_limit:
                     continue
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
+            if SHOW_MASK_COLORS:
+                for s, box in enumerate(last_slot_boxes):
+                    if box is None:
+                        continue
+                    x1, y1, x2, y2 = box
+                    color = COLOR_PALETTE[s % len(COLOR_PALETTE)]
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                    label = f"{s+1}"
+                    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 1.2, 3)
+                    lx1 = x1 + max(0, (x2 - x1 - tw) // 2)
+                    ly1 = y1 + max(0, (y2 - y1 + th) // 2)
+                    cv2.putText(
+                        frame,
+                        label,
+                        (lx1, ly1),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        1.2,
+                        (255, 255, 255),
+                        3,
+                    )
         ui.persons_detected = persons
         frame_idx += 1
 
@@ -1609,7 +1675,45 @@ def main() -> int:
                 else:
                     mask = _smooth_mask(mask)
                 mask = _apply_morph(mask, ui.morph)
-                mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+                if SHOW_MASK_COLORS and any(m is not None for m in last_slot_masks):
+                    color_mask = np.zeros((frame.shape[0], frame.shape[1], 3), dtype=np.uint8)
+                    for s, pmask in enumerate(last_slot_masks):
+                        if pmask is None or gallery_centroids[s] is None:
+                            continue
+                        color = COLOR_PALETTE[s % len(COLOR_PALETTE)]
+                        box = last_slot_boxes[s]
+                        if box is None:
+                            continue
+                        x1, y1, x2, y2 = box
+                        if x2 <= x1 or y2 <= y1:
+                            continue
+                        target_h = max(1, y2 - y1)
+                        target_w = max(1, x2 - x1)
+                        if pmask.shape[1] != target_w or pmask.shape[0] != target_h:
+                            pmask = cv2.resize(pmask, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+                        region = color_mask[y1:y2, x1:x2]
+                        region[pmask > 0] = color
+                    for s, box in enumerate(last_slot_boxes):
+                        if box is None:
+                            continue
+                        x1, y1, x2, y2 = box
+                        color = COLOR_PALETTE[s % len(COLOR_PALETTE)]
+                        label = f"{s+1}"
+                        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 1.2, 3)
+                        lx1 = x1 + max(0, (x2 - x1 - tw) // 2)
+                        ly1 = y1 + max(0, (y2 - y1 + th) // 2)
+                        cv2.putText(
+                            color_mask,
+                            label,
+                            (lx1, ly1),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            1.2,
+                            (255, 255, 255),
+                            3,
+                        )
+                    mask_bgr = color_mask
+                else:
+                    mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
             else:
                 mask_bgr = _mask_placeholder((third_w, mask_h))
             mask_view = cv2.resize(mask_bgr, (third_w, mask_h), interpolation=cv2.INTER_NEAREST)
@@ -1669,7 +1773,12 @@ def main() -> int:
                 slot = gallery_slots[i] if i < len(gallery_slots) else None
                 slot_img = np.zeros((thumb, thumb, 3), dtype=np.uint8)
                 if slot is not None:
-                    slot_bgr = cv2.cvtColor(slot, cv2.COLOR_GRAY2BGR)
+                    if SHOW_MASK_COLORS and SHOW_GALLERY_COLORS:
+                        color = COLOR_PALETTE[i % len(COLOR_PALETTE)]
+                        slot_bgr = np.zeros((slot.shape[0], slot.shape[1], 3), dtype=np.uint8)
+                        slot_bgr[slot > 0] = color
+                    else:
+                        slot_bgr = cv2.cvtColor(slot, cv2.COLOR_GRAY2BGR)
                     inner_max = max(1, thumb - inner_margin * 2)
                     scale = gallery_scales[i] if i < len(gallery_scales) else 0.0
                     scale = min(1.0, max(min_scale, scale))
@@ -1687,6 +1796,17 @@ def main() -> int:
                     (60, 60, 60),
                     1,
                 )
+                if SHOW_MASK_COLORS and SHOW_GALLERY_COLORS:
+                    num_color = COLOR_PALETTE[i % len(COLOR_PALETTE)]
+                    cv2.putText(
+                        gallery_canvas,
+                        f"{i+1}",
+                        (x0 + 4, y0 + 14),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        num_color,
+                        2,
+                    )
             canvas[:total_h, gallery_x : gallery_x + gallery_w] = gallery_canvas
         if ndi_gallery is not None and gallery_canvas is not None:
             ndi_gallery.publish(gallery_canvas)
@@ -1720,6 +1840,10 @@ def main() -> int:
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
             break
+        if key == ord("u"):
+            SHOW_MASK_COLORS = not SHOW_MASK_COLORS
+        if key == ord("i"):
+            SHOW_GALLERY_COLORS = not SHOW_GALLERY_COLORS
         if key == ord("c"):
             if cap is not None:
                 try:
