@@ -1782,9 +1782,14 @@ def main() -> int:
                     inner_max = max(1, thumb - inner_margin * 2)
                     scale = gallery_scales[i] if i < len(gallery_scales) else 0.0
                     scale = min(1.0, max(min_scale, scale))
-                    target_h = max(1, int(inner_max * scale))
-                    target_w = target_h
-                    fitted = _fit_to_box_center_mask(slot_bgr, target_w, target_h)
+                    mh, mw = slot_bgr.shape[:2]
+                    if mw >= mh:
+                        target_w = max(1, int(inner_max * scale))
+                        target_h = max(1, int(target_w * (mh / float(max(1, mw)))))
+                    else:
+                        target_h = max(1, int(inner_max * scale))
+                        target_w = max(1, int(target_h * (mw / float(max(1, mh)))))
+                    fitted = cv2.resize(slot_bgr, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
                     x_off = (thumb - target_w) // 2
                     y_off = (thumb - target_h) // 2
                     slot_img[y_off : y_off + target_h, x_off : x_off + target_w] = fitted
