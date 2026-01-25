@@ -10,6 +10,7 @@ import json
 import os
 import sys
 import time
+from fractions import Fraction
 from pathlib import Path
 from dataclasses import dataclass, field
 import threading
@@ -21,7 +22,7 @@ from ultralytics import YOLO
 
 WINDOW_NAME = "NEXT2"
 CANVAS_WIDTH = max(320, int(os.environ.get("NEXT_CANVAS_W", "1536")))
-CANVAS_HEIGHT = max(240, int(os.environ.get("NEXT_CANVAS_H", "864")))
+CANVAS_HEIGHT = max(240, int(os.environ.get("NEXT_CANVAS_H", "800")))
 CAM_MAX_INDEX = max(0, int(os.environ.get("NEXT_CAM_MAX", "4")))
 CAM_WIDTH = max(0, int(os.environ.get("NEXT_CAM_WIDTH", "1280")))
 CAM_HEIGHT = max(0, int(os.environ.get("NEXT_CAM_HEIGHT", "720")))
@@ -36,12 +37,20 @@ MASK_BLUR = max(0, int(os.environ.get("NEXT_MASK_BLUR", "5")))
 MAX_MASK_BLUR = max(1, int(os.environ.get("NEXT_MASK_BLUR_MAX", "15")))
 CONF_MIN = float(os.environ.get("NEXT_CONF_MIN", "0.1"))
 CONF_MAX = float(os.environ.get("NEXT_CONF_MAX", "0.6"))
-IMG_SIZES = [256, 320, 384, 448, 512, 640]
+IMG_SIZES = [256, 320, 384, 448, 512, 640, 768]
 MAX_MORPH = max(0, int(os.environ.get("NEXT_MASK_MORPH_MAX", "5")))
 PERSIST_HOLD_MAX = float(os.environ.get("NEXT_PERSIST_HOLD_MAX", "2.0"))
 PERSIST_RISE_MAX = float(os.environ.get("NEXT_PERSIST_RISE_MAX", "1.0"))
 PERSIST_FALL_MAX = float(os.environ.get("NEXT_PERSIST_FALL_MAX", "1.5"))
 PERSIST_MIN = float(os.environ.get("NEXT_PERSIST_MIN", "0.02"))
+ENABLE_NDI_GALLERY = os.environ.get("NEXT_ENABLE_NDI_GALLERY", "1") == "1"
+NDI_GALLERY_NAME = os.environ.get("NEXT_NDI_GALLERY_NAME", "NEXT2 Gallery NDI")
+AREA_MIN_MAX = float(os.environ.get("NEXT_AREA_MIN_MAX", "0.2"))
+ASPECT_MIN_MIN = float(os.environ.get("NEXT_ASPECT_MIN_MIN", "0.5"))
+ASPECT_MIN_MAX = float(os.environ.get("NEXT_ASPECT_MIN_MAX", "2.5"))
+ASPECT_MAX_MIN = float(os.environ.get("NEXT_ASPECT_MAX_MIN", "1.5"))
+ASPECT_MAX_MAX = float(os.environ.get("NEXT_ASPECT_MAX_MAX", "5.0"))
+SOLIDITY_MIN_MAX = float(os.environ.get("NEXT_SOLIDITY_MIN_MAX", "1.0"))
 GALLERY_SCALE_MIN = float(os.environ.get("NEXT_GALLERY_SCALE_MIN", "0.05"))
 GALLERY_SCALE_MAX = float(os.environ.get("NEXT_GALLERY_SCALE_MAX", "0.6"))
 DEFAULT_SETTINGS_PATH = str(Path(__file__).resolve().parent / "settings.json")
@@ -210,6 +219,85 @@ def _apply_morph(mask: np.ndarray, strength: int) -> np.ndarray:
     return cv2.erode(mask, kernel, iterations=1)
 
 
+def _get_ndi_module():
+    try:
+        import importlib.resources as ir
+
+        try:
+            bin_path = ir.files("cyndilib.wrapper").joinpath("bin")
+            bin_str = str(bin_path)
+            os.environ.setdefault("NDI_RUNTIME_DIR", bin_str)
+            os.environ["DYLD_LIBRARY_PATH"] = f"{bin_str}:{os.environ.get('DYLD_LIBRARY_PATH','')}"
+        except Exception:
+            pass
+        import cyndilib as ndi  # type: ignore
+
+        return ndi
+    except Exception:
+        return None
+
+
+class NDIPublisher:
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.ndi = None
+        self.sender = None
+        self.ready = False
+        self._announced = False
+        self.vf = None
+        if not ENABLE_NDI_GALLERY:
+            return
+        try:
+            ndi = _get_ndi_module()
+            if ndi is None or not hasattr(ndi, "Sender"):
+                raise RuntimeError("NDI no disponible")
+            self.ndi = ndi
+            self.sender = ndi.Sender(ndi_name=name)
+        except Exception as exc:
+            print(f"[NDI] No disponible: {exc}", file=sys.stderr)
+            self.sender = None
+            self.ndi = None
+
+    def publish(self, frame: np.ndarray) -> None:
+        if self.sender is None or self.ndi is None:
+            return
+        try:
+            ndi = self.ndi
+            VideoSendFrame = ndi.video_frame.VideoSendFrame if hasattr(ndi, "video_frame") else None
+            if frame.ndim == 2:
+                frame_bgra = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGRA)
+            else:
+                frame_bgra = cv2.cvtColor(frame, cv2.COLOR_BGR2BGRA)
+            if not frame_bgra.flags["C_CONTIGUOUS"]:
+                frame_bgra = frame_bgra.copy()
+            h, w = frame_bgra.shape[:2]
+            if self.vf is None or self.vf.get_resolution() != (w, h):
+                if VideoSendFrame is None:
+                    print("[NDI] cyndilib sin VideoSendFrame.", file=sys.stderr)
+                    return
+                if self.ready:
+                    try:
+                        self.sender.close()
+                    except Exception:
+                        pass
+                    self.ready = False
+                vf = VideoSendFrame()
+                vf.set_resolution(w, h)
+                vf.set_fourcc(ndi.FourCC.BGRA)
+                vf.set_frame_rate(Fraction(60, 1))
+                self.sender.set_video_frame(vf)
+                self.vf = vf
+                if not self.ready:
+                    self.sender.open()
+                    self.ready = True
+            self.sender.write_video_async(frame_bgra.ravel(order="C"))
+            if not self._announced:
+                print(f"[NDI] Enviando salida NDI '{self.name}' ({w}x{h})", file=sys.stderr)
+                self._announced = True
+        except Exception as exc:
+            print(f"[NDI] Error al publicar: {exc}", file=sys.stderr)
+
+
 def _update_persistent_mask(
     persist_mask: Optional[np.ndarray],
     mask_binary: np.ndarray,
@@ -261,11 +349,25 @@ class InferenceResult:
 
 
 class YoloWorker:
-    def __init__(self, model: YOLO, device: str, conf: float, imgsz: int) -> None:
+    def __init__(
+        self,
+        model: YOLO,
+        device: str,
+        conf: float,
+        imgsz: int,
+        area_min: float,
+        aspect_min: float,
+        aspect_max: float,
+        solidity_min: float,
+    ) -> None:
         self.model = model
         self.device = device
         self.conf = conf
         self.imgsz = imgsz
+        self.area_min = area_min
+        self.aspect_min = aspect_min
+        self.aspect_max = aspect_max
+        self.solidity_min = solidity_min
         self._lock = threading.Lock()
         self._cond = threading.Condition(self._lock)
         self._pending_frame: Optional[np.ndarray] = None
@@ -289,10 +391,22 @@ class YoloWorker:
         with self._lock:
             return self._result
 
-    def update_params(self, conf: float, imgsz: int) -> None:
+    def update_params(
+        self,
+        conf: float,
+        imgsz: int,
+        area_min: float,
+        aspect_min: float,
+        aspect_max: float,
+        solidity_min: float,
+    ) -> None:
         with self._lock:
             self.conf = conf
             self.imgsz = imgsz
+            self.area_min = area_min
+            self.aspect_min = aspect_min
+            self.aspect_max = aspect_max
+            self.solidity_min = solidity_min
 
     def _loop(self) -> None:
         while True:
@@ -328,26 +442,47 @@ class YoloWorker:
                     for idx, cls_id in enumerate(result.boxes.cls):
                         if int(cls_id) != 0:
                             continue
-                        persons += 1
                         x1, y1, x2, y2 = result.boxes.xyxy[idx].int().tolist()
-                        boxes_out.append((x1, y1, x2, y2))
-                        box_h = max(1, y2 - y1)
+                        bx1 = max(0, min(x1, frame.shape[1] - 1))
+                        bx2 = max(0, min(x2, frame.shape[1]))
+                        by1 = max(0, min(y1, frame.shape[0] - 1))
+                        by2 = max(0, min(y2, frame.shape[0]))
+                        if bx2 <= bx1 or by2 <= by1:
+                            continue
+                        box_h = max(1, by2 - by1)
                         size_ratio = box_h / float(frame_h)
-                        person_scales.append(min(1.0, max(0.0, size_ratio)))
-                        person_centroids.append(((x1 + x2) / 2.0, (y1 + y2) / 2.0))
+                        box_area = float((bx2 - bx1) * (by2 - by1))
+                        aspect = (by2 - by1) / float(max(1, bx2 - bx1))
+                        mask_area = None
+                        local_mask = None
+                        pts = None
                         if polygons is not None and idx < len(polygons):
                             pts = polygons[idx].astype(np.int32)
                             if pts.size > 0:
-                                cv2.fillPoly(mask_canvas, [pts], 255)
-                                bx1 = max(0, min(x1, frame.shape[1] - 1))
-                                bx2 = max(0, min(x2, frame.shape[1]))
-                                by1 = max(0, min(y1, frame.shape[0] - 1))
-                                by2 = max(0, min(y2, frame.shape[0]))
-                                if bx2 > bx1 and by2 > by1:
-                                    local_pts = pts - np.array([bx1, by1], dtype=np.int32)
-                                    local_mask = np.zeros((by2 - by1, bx2 - bx1), dtype=np.uint8)
-                                    cv2.fillPoly(local_mask, [local_pts], 255)
-                                    person_masks.append(local_mask)
+                                local_pts = pts - np.array([bx1, by1], dtype=np.int32)
+                                local_mask = np.zeros((by2 - by1, bx2 - bx1), dtype=np.uint8)
+                                cv2.fillPoly(local_mask, [local_pts], 255)
+                                mask_area = float(np.count_nonzero(local_mask))
+                        if mask_area is None:
+                            mask_area = box_area
+                        area_ratio = mask_area / float(frame.shape[0] * frame.shape[1])
+                        solidity = mask_area / max(1.0, box_area)
+                        if (
+                            area_ratio < self.area_min
+                            or aspect < self.aspect_min
+                            or aspect > self.aspect_max
+                            or solidity < self.solidity_min
+                        ):
+                            continue
+                        if local_mask is None:
+                            continue
+                        persons += 1
+                        boxes_out.append((bx1, by1, bx2, by2))
+                        person_scales.append(min(1.0, max(0.0, size_ratio)))
+                        person_centroids.append(((bx1 + bx2) / 2.0, (by1 + by2) / 2.0))
+                        person_masks.append(local_mask)
+                        if mask_canvas is not None and pts is not None:
+                            cv2.fillPoly(mask_canvas, [pts], 255)
                     if mask_canvas is not None:
                         combined_mask = mask_canvas
                 with self._lock:
@@ -382,6 +517,10 @@ class UIState:
     rise_drag: bool = False
     fall_drag: bool = False
     size_drag: bool = False
+    area_drag: bool = False
+    aspect_min_drag: bool = False
+    aspect_max_drag: bool = False
+    solidity_drag: bool = False
     conf: float = YOLO_CONF
     imgsz_idx: int = 0
     blur: int = MASK_BLUR
@@ -390,6 +529,10 @@ class UIState:
     rise: float = 0.12
     fall: float = 0.25
     size_smooth: float = 0.35
+    area_min: float = 0.005
+    aspect_min: float = 0.8
+    aspect_max: float = 5.5
+    solidity_min: float = 0.15
     rects: Dict[str, Tuple[int, int, int, int]] = field(default_factory=dict)
 
 
@@ -771,6 +914,118 @@ def _draw_ui(canvas: np.ndarray, ui: UIState, start_x: int) -> None:
     )
     y += slider_h + UI_SECTION_GAP
 
+    area_val = min(AREA_MIN_MAX, max(0.0, ui.area_min))
+    cv2.putText(
+        canvas,
+        f"MIN AREA | {area_val:.3f}",
+        (start_x, y + 12),
+        UI_FONT,
+        UI_FONT_SCALE,
+        (200, 200, 200),
+        UI_TEXT_THICKNESS,
+        lineType=cv2.LINE_8,
+    )
+    y += UI_LABEL_GAP
+    rect = (start_x, y, start_x + slider_w, y + slider_h)
+    ui.rects["area_slider"] = rect
+    cv2.rectangle(canvas, (rect[0], rect[1]), (rect[2], rect[3]), (80, 80, 80), -1)
+    cv2.rectangle(canvas, (rect[0], rect[1]), (rect[2], rect[3]), (140, 140, 140), 1)
+    ratio = area_val / max(AREA_MIN_MAX, 1e-6)
+    ratio = min(1.0, max(0.0, ratio))
+    knob_x = rect[0] + int(ratio * slider_w)
+    cv2.rectangle(
+        canvas,
+        (knob_x - 4, rect[1] - 4),
+        (knob_x + 4, rect[3] + 4),
+        (0, 140, 120),
+        -1,
+    )
+    y += slider_h + UI_SECTION_GAP
+
+    aspect_min_val = min(ASPECT_MIN_MAX, max(ASPECT_MIN_MIN, ui.aspect_min))
+    cv2.putText(
+        canvas,
+        f"ASPECT MIN | {aspect_min_val:.2f}",
+        (start_x, y + 12),
+        UI_FONT,
+        UI_FONT_SCALE,
+        (200, 200, 200),
+        UI_TEXT_THICKNESS,
+        lineType=cv2.LINE_8,
+    )
+    y += UI_LABEL_GAP
+    rect = (start_x, y, start_x + slider_w, y + slider_h)
+    ui.rects["aspect_min_slider"] = rect
+    cv2.rectangle(canvas, (rect[0], rect[1]), (rect[2], rect[3]), (80, 80, 80), -1)
+    cv2.rectangle(canvas, (rect[0], rect[1]), (rect[2], rect[3]), (140, 140, 140), 1)
+    ratio = (aspect_min_val - ASPECT_MIN_MIN) / max(ASPECT_MIN_MAX - ASPECT_MIN_MIN, 1e-6)
+    ratio = min(1.0, max(0.0, ratio))
+    knob_x = rect[0] + int(ratio * slider_w)
+    cv2.rectangle(
+        canvas,
+        (knob_x - 4, rect[1] - 4),
+        (knob_x + 4, rect[3] + 4),
+        (0, 140, 120),
+        -1,
+    )
+    y += slider_h + UI_SECTION_GAP
+
+    aspect_max_val = min(ASPECT_MAX_MAX, max(ASPECT_MAX_MIN, ui.aspect_max))
+    cv2.putText(
+        canvas,
+        f"ASPECT MAX | {aspect_max_val:.2f}",
+        (start_x, y + 12),
+        UI_FONT,
+        UI_FONT_SCALE,
+        (200, 200, 200),
+        UI_TEXT_THICKNESS,
+        lineType=cv2.LINE_8,
+    )
+    y += UI_LABEL_GAP
+    rect = (start_x, y, start_x + slider_w, y + slider_h)
+    ui.rects["aspect_max_slider"] = rect
+    cv2.rectangle(canvas, (rect[0], rect[1]), (rect[2], rect[3]), (80, 80, 80), -1)
+    cv2.rectangle(canvas, (rect[0], rect[1]), (rect[2], rect[3]), (140, 140, 140), 1)
+    ratio = (aspect_max_val - ASPECT_MAX_MIN) / max(ASPECT_MAX_MAX - ASPECT_MAX_MIN, 1e-6)
+    ratio = min(1.0, max(0.0, ratio))
+    knob_x = rect[0] + int(ratio * slider_w)
+    cv2.rectangle(
+        canvas,
+        (knob_x - 4, rect[1] - 4),
+        (knob_x + 4, rect[3] + 4),
+        (0, 140, 120),
+        -1,
+    )
+    y += slider_h + UI_SECTION_GAP
+
+    solidity_val = min(SOLIDITY_MIN_MAX, max(0.0, ui.solidity_min))
+    cv2.putText(
+        canvas,
+        f"SOLIDITY | {solidity_val:.2f}",
+        (start_x, y + 12),
+        UI_FONT,
+        UI_FONT_SCALE,
+        (200, 200, 200),
+        UI_TEXT_THICKNESS,
+        lineType=cv2.LINE_8,
+    )
+    y += UI_LABEL_GAP
+    rect = (start_x, y, start_x + slider_w, y + slider_h)
+    ui.rects["solidity_slider"] = rect
+    cv2.rectangle(canvas, (rect[0], rect[1]), (rect[2], rect[3]), (80, 80, 80), -1)
+    cv2.rectangle(canvas, (rect[0], rect[1]), (rect[2], rect[3]), (140, 140, 140), 1)
+    ratio = solidity_val / max(SOLIDITY_MIN_MAX, 1e-6)
+    ratio = min(1.0, max(0.0, ratio))
+    knob_x = rect[0] + int(ratio * slider_w)
+    cv2.rectangle(
+        canvas,
+        (knob_x - 4, rect[1] - 4),
+        (knob_x + 4, rect[3] + 4),
+        (0, 140, 120),
+        -1,
+    )
+    y += slider_h + UI_SECTION_GAP
+
 
 def main() -> int:
     cv2.setUseOptimized(True)
@@ -799,7 +1054,8 @@ def main() -> int:
         except Exception:
             device = "cpu"
 
-    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE | cv2.WINDOW_GUI_NORMAL)
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL | cv2.WINDOW_GUI_NORMAL)
+    cv2.resizeWindow(WINDOW_NAME, CANVAS_WIDTH, CANVAS_HEIGHT)
     ui = UIState()
     settings = _load_settings(SETTINGS_PATH)
     cam_index = max(0, int(settings.get("cam_index", 0)))
@@ -825,6 +1081,14 @@ def main() -> int:
         ui.rise = float(settings.get("rise", ui.rise))
     if "fall" in settings:
         ui.fall = float(settings.get("fall", ui.fall))
+    if "area_min" in settings:
+        ui.area_min = float(settings.get("area_min", ui.area_min))
+    if "aspect_min" in settings:
+        ui.aspect_min = float(settings.get("aspect_min", ui.aspect_min))
+    if "aspect_max" in settings:
+        ui.aspect_max = float(settings.get("aspect_max", ui.aspect_max))
+    if "solidity_min" in settings:
+        ui.solidity_min = float(settings.get("solidity_min", ui.solidity_min))
     if "size_smooth" in settings:
         ui.size_smooth = float(settings.get("size_smooth", ui.size_smooth))
 
@@ -874,7 +1138,16 @@ def main() -> int:
             worker = None
         if model is not None:
             imgsz_val = IMG_SIZES[ui.imgsz_idx] if IMG_SIZES else YOLO_IMGSZ
-            worker = YoloWorker(model, device, ui.conf, imgsz_val)
+            worker = YoloWorker(
+                model,
+                device,
+                ui.conf,
+                imgsz_val,
+                ui.area_min,
+                ui.aspect_min,
+                ui.aspect_max,
+                ui.solidity_min,
+            )
 
     reset_worker()
 
@@ -991,6 +1264,38 @@ def main() -> int:
                     ui.size_smooth = GALLERY_SCALE_MIN + ratio * (GALLERY_SCALE_MAX - GALLERY_SCALE_MIN)
                     mark_dirty()
                 return
+            rect = ui.rects.get("area_slider")
+            if rect and rect[0] <= x <= rect[2] and rect[1] <= y <= rect[3]:
+                ui.area_drag = True
+                if rect[2] > rect[0]:
+                    ratio = (x - rect[0]) / float(rect[2] - rect[0])
+                    ui.area_min = ratio * AREA_MIN_MAX
+                    mark_dirty()
+                return
+            rect = ui.rects.get("aspect_min_slider")
+            if rect and rect[0] <= x <= rect[2] and rect[1] <= y <= rect[3]:
+                ui.aspect_min_drag = True
+                if rect[2] > rect[0]:
+                    ratio = (x - rect[0]) / float(rect[2] - rect[0])
+                    ui.aspect_min = ASPECT_MIN_MIN + ratio * (ASPECT_MIN_MAX - ASPECT_MIN_MIN)
+                    mark_dirty()
+                return
+            rect = ui.rects.get("aspect_max_slider")
+            if rect and rect[0] <= x <= rect[2] and rect[1] <= y <= rect[3]:
+                ui.aspect_max_drag = True
+                if rect[2] > rect[0]:
+                    ratio = (x - rect[0]) / float(rect[2] - rect[0])
+                    ui.aspect_max = ASPECT_MAX_MIN + ratio * (ASPECT_MAX_MAX - ASPECT_MAX_MIN)
+                    mark_dirty()
+                return
+            rect = ui.rects.get("solidity_slider")
+            if rect and rect[0] <= x <= rect[2] and rect[1] <= y <= rect[3]:
+                ui.solidity_drag = True
+                if rect[2] > rect[0]:
+                    ratio = (x - rect[0]) / float(rect[2] - rect[0])
+                    ui.solidity_min = ratio * SOLIDITY_MIN_MAX
+                    mark_dirty()
+                return
         if event == cv2.EVENT_LBUTTONUP:
             ui.slider_drag = False
             ui.skip_drag = False
@@ -1002,6 +1307,10 @@ def main() -> int:
             ui.rise_drag = False
             ui.fall_drag = False
             ui.size_drag = False
+            ui.area_drag = False
+            ui.aspect_min_drag = False
+            ui.aspect_max_drag = False
+            ui.solidity_drag = False
         if event == cv2.EVENT_MOUSEMOVE and ui.slider_drag:
             rect = ui.rects.get("slider")
             if rect and rect[2] > rect[0]:
@@ -1072,13 +1381,48 @@ def main() -> int:
                 ratio = min(1.0, max(0.0, ratio))
                 ui.size_smooth = GALLERY_SCALE_MIN + ratio * (GALLERY_SCALE_MAX - GALLERY_SCALE_MIN)
                 mark_dirty()
+        if event == cv2.EVENT_MOUSEMOVE and ui.area_drag:
+            rect = ui.rects.get("area_slider")
+            if rect and rect[2] > rect[0]:
+                ratio = (x - rect[0]) / float(rect[2] - rect[0])
+                ratio = min(1.0, max(0.0, ratio))
+                ui.area_min = ratio * AREA_MIN_MAX
+                mark_dirty()
+        if event == cv2.EVENT_MOUSEMOVE and ui.aspect_min_drag:
+            rect = ui.rects.get("aspect_min_slider")
+            if rect and rect[2] > rect[0]:
+                ratio = (x - rect[0]) / float(rect[2] - rect[0])
+                ratio = min(1.0, max(0.0, ratio))
+                ui.aspect_min = ASPECT_MIN_MIN + ratio * (ASPECT_MIN_MAX - ASPECT_MIN_MIN)
+                mark_dirty()
+        if event == cv2.EVENT_MOUSEMOVE and ui.aspect_max_drag:
+            rect = ui.rects.get("aspect_max_slider")
+            if rect and rect[2] > rect[0]:
+                ratio = (x - rect[0]) / float(rect[2] - rect[0])
+                ratio = min(1.0, max(0.0, ratio))
+                ui.aspect_max = ASPECT_MAX_MIN + ratio * (ASPECT_MAX_MAX - ASPECT_MAX_MIN)
+                mark_dirty()
+        if event == cv2.EVENT_MOUSEMOVE and ui.solidity_drag:
+            rect = ui.rects.get("solidity_slider")
+            if rect and rect[2] > rect[0]:
+                ratio = (x - rect[0]) / float(rect[2] - rect[0])
+                ratio = min(1.0, max(0.0, ratio))
+                ui.solidity_min = ratio * SOLIDITY_MIN_MAX
+                mark_dirty()
 
     cv2.setMouseCallback(WINDOW_NAME, on_mouse)
     frame_idx = 0
     last_boxes: list[Tuple[int, int, int, int]] = []
     last_persons = 0
     last_mask = None
-    last_params = (ui.conf, IMG_SIZES[ui.imgsz_idx] if IMG_SIZES else YOLO_IMGSZ)
+    last_params = (
+        ui.conf,
+        IMG_SIZES[ui.imgsz_idx] if IMG_SIZES else YOLO_IMGSZ,
+        ui.area_min,
+        ui.aspect_min,
+        ui.aspect_max,
+        ui.solidity_min,
+    )
     last_saved = 0.0
     settings_dirty = False
     gallery_slots: list[Optional[np.ndarray]] = [None for _ in range(MAX_PERSON_LIMIT)]
@@ -1087,6 +1431,7 @@ def main() -> int:
     gallery_last_time: list[Optional[float]] = [None for _ in range(MAX_PERSON_LIMIT)]
     gallery_last_mask: list[Optional[np.ndarray]] = [None for _ in range(MAX_PERSON_LIMIT)]
     gallery_centroids: list[Optional[Tuple[float, float]]] = [None for _ in range(MAX_PERSON_LIMIT)]
+    ndi_gallery = NDIPublisher(NDI_GALLERY_NAME) if ENABLE_NDI_GALLERY else None
 
     def mark_dirty() -> None:
         nonlocal settings_dirty
@@ -1108,9 +1453,16 @@ def main() -> int:
         persons = 0
         if worker is not None:
             imgsz_val = IMG_SIZES[ui.imgsz_idx] if IMG_SIZES else YOLO_IMGSZ
-            params = (ui.conf, imgsz_val)
+            params = (ui.conf, imgsz_val, ui.area_min, ui.aspect_min, ui.aspect_max, ui.solidity_min)
             if params != last_params:
-                worker.update_params(ui.conf, imgsz_val)
+                worker.update_params(
+                    ui.conf,
+                    imgsz_val,
+                    ui.area_min,
+                    ui.aspect_min,
+                    ui.aspect_max,
+                    ui.solidity_min,
+                )
                 last_params = params
             skip_frames = ui.skip_frames if MAX_SKIP_FRAMES > 0 else YOLO_SKIP_FRAMES
             run_infer = skip_frames == 0 or (frame_idx % (skip_frames + 1) == 0)
@@ -1239,7 +1591,7 @@ def main() -> int:
         cam_h = cam_view.shape[0]
         mask_top = cam_h
         mask_h = cam_h
-        total_h = cam_h + mask_h
+        total_h = max(CANVAS_HEIGHT, cam_h + mask_h)
         canvas = np.zeros((total_h, CANVAS_WIDTH, 3), dtype=np.uint8)
         canvas[:cam_h, :third_w] = cam_view
         if mask_h > 0:
@@ -1283,6 +1635,7 @@ def main() -> int:
         _draw_ui(canvas, ui, ui_start_x)
         gallery_x = ui_start_x + UI_PANEL_W + UI_LEFT_MARGIN
         gallery_w = max(0, CANVAS_WIDTH - gallery_x - UI_LEFT_MARGIN)
+        gallery_canvas = None
         if gallery_w > 60:
             gap = 0
             inner_margin = 2
@@ -1307,10 +1660,11 @@ def main() -> int:
             rows_needed = max(1, int(np.ceil(show_slots / float(cols))))
             thumb = best_thumb
             start_y = UI_TOP_MARGIN
+            gallery_canvas = np.zeros((total_h, gallery_w, 3), dtype=np.uint8)
             for i in range(show_slots):
                 col = i % cols
                 row = i // cols
-                x0 = gallery_x + col * (thumb + gap)
+                x0 = col * (thumb + gap)
                 y0 = start_y + row * (thumb + gap)
                 slot = gallery_slots[i] if i < len(gallery_slots) else None
                 slot_img = np.zeros((thumb, thumb, 3), dtype=np.uint8)
@@ -1325,8 +1679,17 @@ def main() -> int:
                     x_off = (thumb - target_w) // 2
                     y_off = (thumb - target_h) // 2
                     slot_img[y_off : y_off + target_h, x_off : x_off + target_w] = fitted
-                canvas[y0 : y0 + thumb, x0 : x0 + thumb] = slot_img
-                cv2.rectangle(canvas, (x0, y0), (x0 + thumb - 1, y0 + thumb - 1), (60, 60, 60), 1)
+                gallery_canvas[y0 : y0 + thumb, x0 : x0 + thumb] = slot_img
+                cv2.rectangle(
+                    gallery_canvas,
+                    (x0, y0),
+                    (x0 + thumb - 1, y0 + thumb - 1),
+                    (60, 60, 60),
+                    1,
+                )
+            canvas[:total_h, gallery_x : gallery_x + gallery_w] = gallery_canvas
+        if ndi_gallery is not None and gallery_canvas is not None:
+            ndi_gallery.publish(gallery_canvas)
         cv2.imshow(WINDOW_NAME, canvas)
 
         now_time = time.time()
@@ -1345,6 +1708,10 @@ def main() -> int:
                 "rise": ui.rise,
                 "fall": ui.fall,
                 "size_smooth": ui.size_smooth,
+                "area_min": ui.area_min,
+                "aspect_min": ui.aspect_min,
+                "aspect_max": ui.aspect_max,
+                "solidity_min": ui.solidity_min,
             }
             _save_settings(SETTINGS_PATH, data)
             last_saved = now_time
@@ -1392,6 +1759,10 @@ def main() -> int:
             "rise": ui.rise,
             "fall": ui.fall,
             "size_smooth": ui.size_smooth,
+            "area_min": ui.area_min,
+            "aspect_min": ui.aspect_min,
+            "aspect_max": ui.aspect_max,
+            "solidity_min": ui.solidity_min,
         }
         _save_settings(SETTINGS_PATH, data)
     return 0
