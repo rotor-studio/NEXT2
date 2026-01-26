@@ -1633,6 +1633,9 @@ def main() -> int:
                 for s, box in enumerate(last_slot_boxes):
                     if box is None:
                         continue
+                    persist = gallery_persist[s]
+                    if persist is None or float(persist.max()) < 0.02:
+                        continue
                     x1, y1, x2, y2 = box
                     color = COLOR_PALETTE[s % len(COLOR_PALETTE)]
                     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
@@ -1675,10 +1678,10 @@ def main() -> int:
                 else:
                     mask = _smooth_mask(mask)
                 mask = _apply_morph(mask, ui.morph)
-                if SHOW_MASK_COLORS and any(m is not None for m in last_slot_masks):
+                if SHOW_MASK_COLORS and any(p is not None for p in gallery_persist):
                     color_mask = np.zeros((frame.shape[0], frame.shape[1], 3), dtype=np.uint8)
-                    for s, pmask in enumerate(last_slot_masks):
-                        if pmask is None or gallery_centroids[s] is None:
+                    for s, persist in enumerate(gallery_persist):
+                        if persist is None or gallery_centroids[s] is None:
                             continue
                         color = COLOR_PALETTE[s % len(COLOR_PALETTE)]
                         box = last_slot_boxes[s]
@@ -1689,15 +1692,23 @@ def main() -> int:
                             continue
                         target_h = max(1, y2 - y1)
                         target_w = max(1, x2 - x1)
-                        if pmask.shape[1] != target_w or pmask.shape[0] != target_h:
-                            pmask = cv2.resize(pmask, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+                        if persist.shape[1] != target_w or persist.shape[0] != target_h:
+                            persist = cv2.resize(persist, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+                        if float(persist.max()) < 0.02:
+                            continue
                         region = color_mask[y1:y2, x1:x2]
-                        region[pmask > 0] = color
+                        alpha = np.clip(persist, 0.0, 1.0)[:, :, None]
+                        color_arr = np.zeros_like(region)
+                        color_arr[:, :] = color
+                        blended = (region.astype(np.float32) * (1.0 - alpha) + color_arr.astype(np.float32) * alpha)
+                        region[:] = blended.astype(np.uint8)
                     for s, box in enumerate(last_slot_boxes):
                         if box is None:
                             continue
+                        persist = gallery_persist[s]
+                        if persist is None or float(persist.max()) < 0.02:
+                            continue
                         x1, y1, x2, y2 = box
-                        color = COLOR_PALETTE[s % len(COLOR_PALETTE)]
                         label = f"{s+1}"
                         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 1.2, 3)
                         lx1 = x1 + max(0, (x2 - x1 - tw) // 2)
@@ -1773,6 +1784,13 @@ def main() -> int:
                 slot = gallery_slots[i] if i < len(gallery_slots) else None
                 slot_img = np.zeros((thumb, thumb, 3), dtype=np.uint8)
                 if slot is not None:
+                    ys, xs = np.where(slot > 0)
+                    if ys.size > 0 and xs.size > 0:
+                        y1c = int(ys.min())
+                        y2c = int(ys.max()) + 1
+                        x1c = int(xs.min())
+                        x2c = int(xs.max()) + 1
+                        slot = slot[y1c:y2c, x1c:x2c]
                     if SHOW_MASK_COLORS and SHOW_GALLERY_COLORS:
                         color = COLOR_PALETTE[i % len(COLOR_PALETTE)]
                         slot_bgr = np.zeros((slot.shape[0], slot.shape[1], 3), dtype=np.uint8)
