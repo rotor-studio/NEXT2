@@ -45,6 +45,7 @@ PERSIST_FALL_MAX = float(os.environ.get("NEXT_PERSIST_FALL_MAX", "1.5"))
 PERSIST_MIN = float(os.environ.get("NEXT_PERSIST_MIN", "0.02"))
 ENABLE_NDI_GALLERY = os.environ.get("NEXT_ENABLE_NDI_GALLERY", "1") == "1"
 NDI_GALLERY_NAME = os.environ.get("NEXT_NDI_GALLERY_NAME", "NEXT2 Gallery NDI")
+NDI_INPUT_FILTER = os.environ.get("NEXT_NDI_INPUT_FILTER", NDI_GALLERY_NAME)
 AREA_MIN_MAX = float(os.environ.get("NEXT_AREA_MIN_MAX", "0.2"))
 ASPECT_MIN_MIN = float(os.environ.get("NEXT_ASPECT_MIN_MIN", "0.5"))
 ASPECT_MIN_MAX = float(os.environ.get("NEXT_ASPECT_MIN_MAX", "2.5"))
@@ -199,6 +200,12 @@ def _fit_to_width(image: np.ndarray, target_w: int) -> np.ndarray:
     new_h = max(1, int(h * scale))
     return cv2.resize(image, (target_w, new_h), interpolation=cv2.INTER_AREA)
 
+
+def _resize_to_resolution(image: np.ndarray, target_w: int, target_h: int) -> np.ndarray:
+    if image.shape[1] == target_w and image.shape[0] == target_h:
+        return image
+    return cv2.resize(image, (target_w, target_h), interpolation=cv2.INTER_AREA)
+
 def _mask_placeholder(frame_size: Tuple[int, int]) -> np.ndarray:
     w, h = frame_size
     img = np.zeros((h, w, 3), dtype=np.uint8)
@@ -309,6 +316,132 @@ class NDIPublisher:
         except Exception as exc:
             print(f"[NDI] Error al publicar: {exc}", file=sys.stderr)
 
+
+class NDIReceiver:
+    def __init__(self, source):
+        self.ndi = _get_ndi_module()
+        self.recv = None
+        self.fs = None
+        self.source_obj = None
+        self.source_name = ""
+        if isinstance(source, tuple) and len(source) >= 1:
+            self.source_name = str(source[0]) if source[0] is not None else ""
+            if len(source) > 1:
+                self.source_obj = source[1]
+        elif isinstance(source, str):
+            self.source_name = source
+        else:
+            self.source_obj = source
+            self.source_name = getattr(source, "name", "") or ""
+        if self.ndi is None:
+            return
+        try:
+            self.recv = self.ndi.Receiver(
+                source_name=self.source_name,
+                color_format=self.ndi.RecvColorFormat.BGRX_BGRA,
+                bandwidth=self.ndi.RecvBandwidth.highest,
+                allow_video_fields=False,
+                recv_name="NEXT2_ndi_in",
+            )
+            self.fs = self.recv.frame_sync
+            self.fs.set_video_frame(self.ndi.VideoFrameSync())
+            if self.source_obj is not None:
+                try:
+                    self.recv.connect_to(self.source_obj)
+                except Exception:
+                    pass
+            try:
+                self.recv._wait_for_connect(2.0)
+            except Exception:
+                pass
+        except Exception as exc:
+            print(f"[NDI] Error al abrir entrada: {exc}", file=sys.stderr)
+            self.recv = None
+            self.fs = None
+
+    def read(self) -> tuple[bool, Optional[np.ndarray]]:
+        if self.recv is None or self.fs is None:
+            return False, None
+        try:
+            self.fs.capture_video()
+            vf = self.fs.video_frame
+            w, h = vf.get_resolution()
+            if w <= 0 or h <= 0:
+                return False, None
+            stride = vf.get_line_stride()
+            mv = memoryview(vf)
+            flat = np.frombuffer(mv, dtype=np.uint8).copy()
+            mv.release()
+            if flat.size < stride * h:
+                return False, None
+            frame_bgra = flat[: stride * h].reshape((h, stride))[:, : w * 4].reshape((h, w, 4))
+            frame = frame_bgra[:, :, :3].copy()
+            return True, frame
+        except Exception:
+            return False, None
+
+    def release(self) -> None:
+        try:
+            if self.recv is not None:
+                self.recv.disconnect()
+        except Exception:
+            pass
+        self.recv = None
+        self.fs = None
+
+
+def list_ndi_sources() -> list[tuple[str, Optional[object]]]:
+    ndi = _get_ndi_module()
+    names: list[str] = []
+    sources: list[tuple[str, Optional[object]]] = []
+    if ndi is not None:
+        try:
+            if hasattr(ndi, "Finder"):
+                finder = ndi.Finder()
+                finder.open()
+                finder.wait_for_sources(2.0)
+                found = list(finder.iter_sources())
+                finder.close()
+                sources = [
+                    (getattr(s, "name", ""), s) for s in found if getattr(s, "name", "")
+                ]
+                names = [s[0] for s in sources]
+            else:
+                finder = ndi.find_create_v2()
+                ndi.find_wait_for_sources(finder, 2000)
+                found = ndi.find_get_current_sources(finder)
+                ndi.find_destroy(finder)
+                sources = [
+                    (getattr(s, "ndi_name", ""), None)
+                    for s in found
+                    if getattr(s, "ndi_name", "")
+                ]
+                names = [s[0] for s in sources]
+        except Exception:
+            names = []
+            sources = []
+    if not names:
+        try:
+            import NDIlib as ndi_py  # type: ignore
+
+            if ndi_py.initialize():
+                finder = ndi_py.find_create_v2()
+                ndi_py.find_wait_for_sources(finder, 2000)
+                found = ndi_py.find_get_current_sources(finder)
+                ndi_py.find_destroy(finder)
+                sources = [
+                    (getattr(s, "ndi_name", ""), None)
+                    for s in found
+                    if getattr(s, "ndi_name", "")
+                ]
+                names = [s[0] for s in sources]
+        except Exception:
+            names = []
+            sources = []
+    if NDI_INPUT_FILTER:
+        needle = NDI_INPUT_FILTER.lower()
+        sources = [s for s in sources if needle not in s[0].lower()]
+    return sources
 
 def _update_persistent_mask(
     persist_mask: Optional[np.ndarray],
@@ -1076,6 +1209,12 @@ def main() -> int:
     ui = UIState()
     settings = _load_settings(SETTINGS_PATH)
     cam_index = max(0, int(settings.get("cam_index", 0)))
+    input_mode = "cam"
+    ndi_sources: list[tuple[str, Optional[object]]] = []
+    ndi_index = -1
+    ndi_receiver: Optional[NDIReceiver] = None
+    ndi_name = ""
+    source_label = f"CAM {cam_index + 1}"
     if "selected_res" in settings:
         ui.selected_res = int(settings.get("selected_res", ui.selected_res))
     if "selected_model" in settings:
@@ -1108,10 +1247,17 @@ def main() -> int:
         ui.solidity_min = float(settings.get("solidity_min", ui.solidity_min))
     if "size_smooth" in settings:
         ui.size_smooth = float(settings.get("size_smooth", ui.size_smooth))
+    if "input_mode" in settings:
+        input_mode = str(settings.get("input_mode", input_mode))
+    if "ndi_name" in settings:
+        ndi_name = str(settings.get("ndi_name", ndi_name))
 
     cap, cam_index = _cycle_camera(cam_index)
     if cap is None:
         print("[CAM] No cameras available.", file=sys.stderr)
+        source_label = "NO CAM"
+    else:
+        source_label = f"CAM {cam_index + 1}"
     for idx, (_, w, h) in enumerate(RES_OPTIONS):
         if w == CAM_WIDTH and h == CAM_HEIGHT:
             if "selected_res" not in settings:
@@ -1189,6 +1335,16 @@ def main() -> int:
 
     def on_mouse(event: int, x: int, y: int, flags: int, param: object) -> None:
         if event == cv2.EVENT_LBUTTONDOWN:
+            rect = ui.rects.get("cam_cycle_btn")
+            if rect and rect[0] <= x <= rect[2] and rect[1] <= y <= rect[3]:
+                _switch_to_camera(cam_index + 1)
+                mark_dirty()
+                return
+            rect = ui.rects.get("ndi_cycle_btn")
+            if rect and rect[0] <= x <= rect[2] and rect[1] <= y <= rect[3]:
+                _switch_to_ndi()
+                mark_dirty()
+                return
             for idx in range(len(RES_OPTIONS)):
                 rect = ui.rects.get(f"res_{idx}")
                 if rect and rect[0] <= x <= rect[2] and rect[1] <= y <= rect[3]:
@@ -1456,13 +1612,92 @@ def main() -> int:
     def mark_dirty() -> None:
         nonlocal settings_dirty
         settings_dirty = True
-    while True:
+
+    def _switch_to_camera(next_idx: Optional[int] = None) -> None:
+        nonlocal cap, cam_index, ndi_receiver, input_mode, source_label, ndi_name
+        if ndi_receiver is not None:
+            ndi_receiver.release()
+            ndi_receiver = None
         if cap is not None:
+            try:
+                cap.release()
+            except Exception:
+                pass
+        if next_idx is None:
+            next_idx = cam_index
+        cap, cam_index = _cycle_camera(next_idx)
+        if cap is None:
+            print("[CAM] No cameras available.", file=sys.stderr)
+            source_label = "NO CAM"
+        else:
+            source_label = f"CAM {cam_index + 1}"
+        input_mode = "cam"
+        ndi_name = ""
+
+    def _switch_to_ndi(next_idx: Optional[int] = None) -> None:
+        nonlocal cap, cam_index, ndi_sources, ndi_index, ndi_receiver, input_mode, source_label, ndi_name
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception:
+                pass
+        cap = None
+        if ndi_receiver is not None:
+            ndi_receiver.release()
+            ndi_receiver = None
+        ndi_sources = list_ndi_sources()
+        if ndi_sources:
+            print(f"[NDI] Fuentes: {[s[0] for s in ndi_sources]}", file=sys.stderr)
+        if not ndi_sources:
+            print("[NDI] No NDI sources available.", file=sys.stderr)
+            source_label = "NO NDI"
+            input_mode = "cam"
+            cap, cam_index = _cycle_camera(cam_index)
+            if cap is None:
+                print("[CAM] No cameras available.", file=sys.stderr)
+                source_label = "NO CAM"
+            else:
+                source_label = f"CAM {cam_index + 1}"
+            ndi_name = ""
+            return
+        if next_idx is None:
+            next_idx = (ndi_index + 1) % len(ndi_sources)
+        ndi_index = next_idx % len(ndi_sources)
+        source = ndi_sources[ndi_index]
+        ndi_name = source[0]
+        print(f"[NDI] Conectando a '{ndi_name}'", file=sys.stderr)
+        ndi_receiver = NDIReceiver(source)
+        source_label = f"NDI {ndi_index + 1}"
+        input_mode = "ndi"
+
+    def _switch_to_ndi_name(target: str) -> bool:
+        nonlocal ndi_sources
+        if not target:
+            return False
+        ndi_sources = list_ndi_sources()
+        for idx, src in enumerate(ndi_sources):
+            if src[0] == target:
+                _switch_to_ndi(idx)
+                return True
+        return False
+
+    if input_mode == "ndi" and ndi_name:
+        if not _switch_to_ndi_name(ndi_name):
+            _switch_to_camera(cam_index)
+    while True:
+        if input_mode == "ndi" and ndi_receiver is not None:
+            ok, frame = ndi_receiver.read()
+            if not ok or frame is None:
+                frame = _placeholder((CAM_WIDTH, CAM_HEIGHT))
+        elif cap is not None:
             ok, frame = cap.read()
             if not ok or frame is None:
                 frame = _placeholder((CAM_WIDTH, CAM_HEIGHT))
         else:
             frame = _placeholder((CAM_WIDTH, CAM_HEIGHT))
+
+        # Normalize input to selected camera resolution to keep UI stable.
+        frame = _resize_to_resolution(frame, CAM_WIDTH, CAM_HEIGHT)
 
         now = time.time()
         dt = now - prev_time
@@ -1656,11 +1891,12 @@ def main() -> int:
         frame_idx += 1
 
         third_w = CANVAS_WIDTH // 3
-        cam_view = _fit_to_width(frame, third_w)
-        cam_h = cam_view.shape[0]
+        cam_h = max(1, int(third_w * CAM_HEIGHT / max(1, CAM_WIDTH)))
+        cam_view = cv2.resize(frame, (third_w, cam_h), interpolation=cv2.INTER_AREA)
         mask_top = cam_h
         mask_h = cam_h
-        total_h = max(CANVAS_HEIGHT, cam_h + mask_h)
+        buttons_space = UI_BTN_H + 20
+        total_h = max(CANVAS_HEIGHT, cam_h + mask_h + buttons_space)
         canvas = np.zeros((total_h, CANVAS_WIDTH, 3), dtype=np.uint8)
         canvas[:cam_h, :third_w] = cam_view
         if mask_h > 0:
@@ -1739,7 +1975,7 @@ def main() -> int:
         res_label = RES_OPTIONS[ui.selected_res][0] if RES_OPTIONS else "N/A"
         cv2.putText(
             canvas,
-            f"CAM {cam_index} {res_label} | FPS {fps:05.1f}",
+            f"{source_label} {res_label} | FPS {fps:05.1f}",
             (20, 30),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,
@@ -1748,6 +1984,30 @@ def main() -> int:
         )
         ui_start_x = third_w + UI_LEFT_MARGIN
         _draw_ui(canvas, ui, ui_start_x)
+        btn_y = mask_top + mask_h + 10
+        btn_total_w = UI_BTN_W * 2 + UI_BTN_GAP
+        btn_x = 10
+        cam_rect = (btn_x, btn_y, btn_x + UI_BTN_W, btn_y + UI_BTN_H)
+        ndi_rect = (btn_x + UI_BTN_W + UI_BTN_GAP, btn_y, btn_x + btn_total_w, btn_y + UI_BTN_H)
+        ui.rects["cam_cycle_btn"] = cam_rect
+        ui.rects["ndi_cycle_btn"] = ndi_rect
+        _draw_button(canvas, "CAM", cam_rect, input_mode == "cam")
+        _draw_button(canvas, "NDI", ndi_rect, input_mode == "ndi")
+        if input_mode == "ndi" and ndi_name:
+            label = ndi_name
+            max_len = 38
+            if len(label) > max_len:
+                label = label[: max_len - 1] + "…"
+            cv2.putText(
+                canvas,
+                label,
+                (ndi_rect[2] + 10, ndi_rect[3] - 6),
+                UI_FONT,
+                UI_FONT_SCALE,
+                (200, 200, 200),
+                UI_TEXT_THICKNESS,
+                lineType=cv2.LINE_8,
+            )
         gallery_x = ui_start_x + UI_PANEL_W + UI_LEFT_MARGIN
         gallery_w = max(0, CANVAS_WIDTH - gallery_x - UI_LEFT_MARGIN)
         gallery_canvas = None
@@ -1855,6 +2115,8 @@ def main() -> int:
                 "aspect_min": ui.aspect_min,
                 "aspect_max": ui.aspect_max,
                 "solidity_min": ui.solidity_min,
+                "input_mode": input_mode,
+                "ndi_name": ndi_name,
             }
             _save_settings(SETTINGS_PATH, data)
             last_saved = now_time
@@ -1868,14 +2130,10 @@ def main() -> int:
         if key == ord("i"):
             SHOW_GALLERY_COLORS = not SHOW_GALLERY_COLORS
         if key == ord("c"):
-            if cap is not None:
-                try:
-                    cap.release()
-                except Exception:
-                    pass
-            cap, cam_index = _cycle_camera(cam_index + 1)
-            if cap is None:
-                print("[CAM] No cameras available.", file=sys.stderr)
+            _switch_to_camera(cam_index + 1)
+            mark_dirty()
+        if key == ord("n"):
+            _switch_to_ndi()
             mark_dirty()
 
         # light sleep to avoid busy loop if camera is missing
@@ -1888,6 +2146,8 @@ def main() -> int:
             cap.release()
         except Exception:
             pass
+    if ndi_receiver is not None:
+        ndi_receiver.release()
     if worker is not None:
         worker.stop()
     cv2.destroyAllWindows()
